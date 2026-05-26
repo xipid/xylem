@@ -340,58 +340,49 @@ void BlobStore::bloomRebuild() {
 String BlobStore::readChain(u32 blockIdx) const {
     if (!device || !allocator) return String();
 
-    // First pass: accumulate total size
-    u32 totalLen = 0;
-    {
-        u32 cur = blockIdx;
-        bool first = true;
-        while (cur != 0) {
-            u16 ec = (cur < allocator->bam.size()) ? allocator->bam[cur].eraseCount : 0u;
-            String blk = device->readBlock(cur, ec);
-            if ((u32)blk.size() < CONT_OVERHEAD) break;
+    u16 firstEc = (blockIdx < allocator->bam.size()) ? allocator->bam[blockIdx].eraseCount : 0u;
+    String firstBlk = device->readBlock(blockIdx, firstEc);
+    if ((u32)firstBlk.size() < CONT_OVERHEAD) return String();
 
-            const u8* ptr = (const u8*)blk.data();
-            ptr++;                     // type
-            u8 isF = *ptr++;
-            u8 kLen = *ptr++;
-            if (isF) ptr += kLen;
-            u32 tLen = *(u32*)ptr; ptr += 4;
-            u32 cLen = *(u32*)ptr; ptr += 4;
-            u32 next = *(u32*)ptr;
+    const u8* ptr = (const u8*)firstBlk.data();
+    ptr++;                     // type
+    u8 isF = *ptr++;
+    u8 kLen = *ptr++;
+    if (!isF) return String(); // Must start with a first block
+    ptr += kLen;               // key
+    u32 totalLen = *(u32*)ptr; ptr += 4;
+    u32 cLen = *(u32*)ptr; ptr += 4;
+    u32 next = *(u32*)ptr; ptr += 4;
 
-            if (first) { totalLen = tLen; first = false; }
-            (void)cLen;
-            cur = next;
-        }
-    }
     if (totalLen == 0) return String();
 
-    // Second pass: read into pre-allocated buffer
     String result; result.allocate(totalLen);
     u32 written = 0;
-    u32 cur = blockIdx;
-    bool isFirstBlock = true;
 
+    // Copy first block payload
+    for (u32 i = 0; i < cLen && written < totalLen; ++i) {
+        result[written++] = *ptr++;
+    }
+
+    u32 cur = next;
     while (cur != 0 && written < totalLen) {
         u16 ec = (cur < allocator->bam.size()) ? allocator->bam[cur].eraseCount : 0u;
         String blk = device->readBlock(cur, ec);
         if ((u32)blk.size() < CONT_OVERHEAD) break;
 
-        const u8* ptr = (const u8*)blk.data();
-        ptr++;             // type
-        u8 isF = *ptr++;
-        u8 kLen = *ptr++;
-        if (isF) ptr += kLen;
-        ptr += 4;          // totalDataLen
-        u32 cLen = *(u32*)ptr; ptr += 4;
-        u32 next = *(u32*)ptr; ptr += 4;
+        const u8* cPtr = (const u8*)blk.data();
+        cPtr++;             // type
+        cPtr++;             // isFirst
+        cPtr++;             // keyLen
+        cPtr += 4;          // totalDataLen
+        u32 chunkLen = *(u32*)cPtr; cPtr += 4;
+        u32 nextBlock = *(u32*)cPtr; cPtr += 4;
 
-        for (u32 i = 0; i < cLen && written < totalLen; ++i) {
-            result[written++] = *ptr++;
+        for (u32 i = 0; i < chunkLen && written < totalLen; ++i) {
+            result[written++] = *cPtr++;
         }
 
-        cur = next;
-        isFirstBlock = false;
+        cur = nextBlock;
     }
 
     return result.slice(0, written);

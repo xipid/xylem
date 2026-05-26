@@ -23,16 +23,20 @@ bool BlockDevice::writeBlock(u32 blockIdx, u16 eraseCount, const String& data) {
     u64 offset = (u64)blockIdx * config.blockSize;
     String finalData = data;
 
-
-
     // Write in chunks of writeSize
     for (u32 chunkOff = 0; chunkOff < finalData.size(); chunkOff += config.writeSize) {
         u32 chunkLen = (chunkOff + config.writeSize > finalData.size()) 
             ? (finalData.size() - chunkOff) 
             : config.writeSize;
             
-        if (!config.onDeviceWrite(offset + chunkOff, finalData.slice(chunkOff, chunkOff + chunkLen))) {
-            return false;
+        if (chunkOff == 0 && chunkLen == finalData.size()) {
+            if (!config.onDeviceWrite(offset + chunkOff, finalData)) {
+                return false;
+            }
+        } else {
+            if (!config.onDeviceWrite(offset + chunkOff, String(finalData.data() + chunkOff, chunkLen))) {
+                return false;
+            }
         }
     }
     return true;
@@ -42,6 +46,15 @@ String BlockDevice::readBlock(u32 blockIdx, u16 eraseCount) {
     if (!config.onDeviceRead) return String();
 
     u64 offset = (u64)blockIdx * config.blockSize;
+
+    if (config.readSize >= config.blockSize) {
+        String chunk = config.onDeviceRead(offset, offset + config.blockSize);
+        if (chunk.size() == config.blockSize) {
+            return chunk;
+        }
+        return String();
+    }
+
     String rawData;
     rawData.allocate(config.blockSize);
 
@@ -59,8 +72,6 @@ String BlockDevice::readBlock(u32 blockIdx, u16 eraseCount) {
             rawData[chunkOff + i] = chunk[i];
         }
     }
-
-
 
     return rawData;
 }

@@ -155,6 +155,7 @@ public:
     // Key: column name → Map of (value → Array of row IDs)
     Map<String, Map<String, Array<u64>>> colHashIndex;
     bool colHashIndexDirty = true; // Mark dirty on any write/remove
+    bool disableIndex = false;
 
     void rebuildColHashIndex();
     void invalidateColHashIndex();

@@ -149,15 +149,32 @@ void TableStore::loadSchemas() {
         }
     }
 
-    // Rebuild ref counts
+    // Load blobRefCounts
     blobRefCounts.clear();
-    for (u64 rId : allRowIds) {
-        Map<String, String>* row = fetchRow(rId);
-        if (row) {
-            for (auto it = row->begin(); it != row->end(); ++it) {
-                String v = it->value;
-                if (globalKeys) v = CryptItem::decrypt(v, *globalKeys);
-                if (isBlobRef(v)) incrementBlobRef(extractBlobHash(v));
+    bool refCountsLoaded = false;
+    if (ptr < end) {
+        u64 refCountSize = readVLU();
+        for (u64 i = 0; i < refCountSize && ptr < end; ++i) {
+            u64 hashLen = readVLU();
+            if (end - ptr < (ptrdiff_t)hashLen) break;
+            String hash((const u8*)ptr, hashLen);
+            ptr += hashLen;
+            u64 refVal = readVLU();
+            blobRefCounts.set(hash, (u32)refVal);
+        }
+        refCountsLoaded = true;
+    }
+
+    if (!refCountsLoaded) {
+        // Rebuild ref counts (fallback for legacy databases)
+        for (u64 rId : allRowIds) {
+            Map<String, String>* row = fetchRow(rId);
+            if (row) {
+                for (auto it = row->begin(); it != row->end(); ++it) {
+                    String v = it->value;
+                    if (globalKeys) v = CryptItem::decrypt(v, *globalKeys);
+                    if (isBlobRef(v)) incrementBlobRef(extractBlobHash(v));
+                }
             }
         }
     }
@@ -174,6 +191,7 @@ void TableStore::saveSchemas() {
         needed += 10 + blobStore->zstd.dictionary[0].size();
     }
 #endif
+    needed += blobRefCounts.size() * 60; // VLU counts + hash strings
     
     String data; data.allocate(needed);
     u8* ptr = data.data();
@@ -218,6 +236,15 @@ void TableStore::saveSchemas() {
 #else
     writeVLU(0);
 #endif
+    
+    // Save blobRefCounts
+    writeVLU(blobRefCounts.size());
+    for (auto it = blobRefCounts.begin(); it != blobRefCounts.end(); ++it) {
+        const String& hash = it->key;
+        writeVLU(hash.size());
+        for (usz i = 0; i < hash.size(); ++i) *ptr++ = hash[i];
+        writeVLU(it->value);
+    }
     
     writeBlob("XYLM_TABLE_ROOT", data.slice(0, ptr - data.data()));
 }
@@ -320,6 +347,7 @@ void TableStore::rebuildColHashIndex() {
         Map<String, String>* row = fetchRow(rId);
         if (!row) continue;
         for (auto it = row->begin(); it != row->end(); ++it) {
+            if (it->key == "content" || it->value.size() > 256) continue;
             String val = it->value;
             if (globalKeys) val = CryptItem::decrypt(val, *globalKeys);
             if (!colHashIndex.has(it->key)) colHashIndex.set(it->key, Map<String, Array<u64>>());
@@ -622,7 +650,7 @@ Array<Map<String, String>> TableStore::read(const Array<String>& columns, const 
             if (c.op != "=") { allEq = false; break; }
             if (c.val.startsWith("parent.")) { allEq = false; break; } 
         }
-        if (allEq && clauses[0].size() > 0 && !clauses[0].isAssert) {
+        if (allEq && clauses[0].size() > 0 && !clauses[0].isAssert && !disableIndex) {
             if (colHashIndexDirty) rebuildColHashIndex();
             
             Array<u64> candidateIds;
@@ -702,7 +730,6 @@ Array<Map<String, String>> TableStore::read(const Array<String>& columns, const 
 
 int TableStore::write(const Array<Clause>& columns, const Array<Clauses>& clauses,
                       const String& encryptionKey, u64 txId, bool isVolatile) {
-    invalidateColHashIndex();
     u16 tId = findOrCreateTable(columns);
     
     // Check ASSERT clauses
@@ -798,13 +825,64 @@ int TableStore::write(const Array<Clause>& columns, const Array<Clauses>& clause
             uningestedVectors.push(rId);
         }
         
+        // Incremental index update
+        if (!colHashIndexDirty) {
+            for (auto it = row.begin(); it != row.end(); ++it) {
+                if (it->key == "content" || it->value.size() > 256) continue;
+                String val = it->value;
+                if (globalKeys) val = CryptItem::decrypt(val, *globalKeys);
+                if (!colHashIndex.has(it->key)) colHashIndex.set(it->key, Map<String, Array<u64>>());
+                colHashIndex.get(it->key)->operator[](val).push(rId);
+            }
+        }
+        
         return 0;
     }
     
     // ─── Update ─────────────────────────────────────────────────────────────
-    for (u64 rId : allRowIds) {
+    Array<u64> candidateIds;
+    bool fastPathUsed = false;
+    if (clauses.size() == 1) { 
+        bool allEq = true;
+        for (const auto& c : clauses[0]) {
+            if (c.op != "=") { allEq = false; break; }
+            if (c.val.startsWith("parent.")) { allEq = false; break; } 
+        }
+        if (allEq && clauses[0].size() > 0 && !clauses[0].isAssert && !disableIndex) {
+            if (colHashIndexDirty) rebuildColHashIndex();
+            
+            bool impossible = false;
+            bool firstCol = true;
+            for (const auto& c : clauses[0]) {
+                auto* valMap = colHashIndex.get(c.col);
+                if (!valMap) { impossible = true; break; } 
+                
+                auto* rowIds = valMap->get(c.val);
+                if (!rowIds) { impossible = true; break; } 
+                
+                if (firstCol) {
+                    candidateIds = *rowIds;
+                    firstCol = false;
+                } else {
+                    Array<u64> intersected;
+                    for (u64 rId : *rowIds) {
+                        for (u64 crId : candidateIds) {
+                            if (rId == crId) { intersected.push(rId); break; }
+                        }
+                    }
+                    candidateIds = intersected;
+                    if (candidateIds.size() == 0) { impossible = true; break; }
+                }
+            }
+            if (!impossible) {
+                fastPathUsed = true;
+            }
+        }
+    }
+
+    auto doUpdateRow = [&](u64 rId) {
         Map<String, String>* row = fetchRow(rId);
-        if (!row) continue;
+        if (!row) return;
         if (evaluateClauses(*row, clauses) >= 0.0f) {
             String keyToUse = encryptionKey;
             if (keyToUse.isEmpty() && globalKeys) {
@@ -836,6 +914,21 @@ int TableStore::write(const Array<Clause>& columns, const Array<Clauses>& clause
                     if (isBlobRef(oldV)) {
                         oldBlobHashToDecrement = extractBlobHash(oldV);
                     }
+                    
+                    // Remove rId from colHashIndex[pc.name][oldV]
+                    if (!colHashIndexDirty && pc.name != "content" && oldV.size() <= 256 && colHashIndex.has(pc.name)) {
+                        auto* valMap = colHashIndex.get(pc.name);
+                        if (valMap->has(oldV)) {
+                            auto* rowIds = valMap->get(oldV);
+                            for (usz j = 0; j < rowIds->size(); ++j) {
+                                if ((*rowIds)[j] == rId) {
+                                    (*rowIds)[j] = (*rowIds)[rowIds->size() - 1];
+                                    rowIds->pop();
+                                    break;
+                                }
+                            }
+                        }
+                    }
                 }
 
                 if (pc.type == ColType::BLOB && blobStore) {
@@ -857,6 +950,20 @@ int TableStore::write(const Array<Clause>& columns, const Array<Clauses>& clause
                     row->set(pc.name, keyToUse.isEmpty() ? col.val : CryptItem::encrypt(col.val, keyToUse));
                 }
 
+                // Add newVal to colHashIndex[pc.name][newVal]
+                if (!colHashIndexDirty && pc.name != "content" && row->has(pc.name)) {
+                    String newVal = *row->get(pc.name);
+                    if (newVal.size() <= 256) {
+                        if (globalKeys) newVal = CryptItem::decrypt(newVal, *globalKeys);
+                        else if (!keyToUse.isEmpty()) {
+                            Array<String> tempKeys; tempKeys.push(keyToUse);
+                            newVal = CryptItem::decrypt(newVal, tempKeys);
+                        }
+                        if (!colHashIndex.has(pc.name)) colHashIndex.set(pc.name, Map<String, Array<u64>>());
+                        colHashIndex.get(pc.name)->operator[](newVal).push(rId);
+                    }
+                }
+
                 // Decrement old blob ref now that the new value has been set
                 if (!oldBlobHashToDecrement.isEmpty()) {
                     decrementBlobRef(oldBlobHashToDecrement);
@@ -872,6 +979,16 @@ int TableStore::write(const Array<Clause>& columns, const Array<Clauses>& clause
             currentMemoryBytes += approxRowBytes(*row);
             updateLru(rId);
         }
+    };
+
+    if (fastPathUsed) {
+        for (u64 rId : candidateIds) {
+            doUpdateRow(rId);
+        }
+    } else {
+        for (u64 rId : allRowIds) {
+            doUpdateRow(rId);
+        }
     }
     evictIfNeeded();
     return 0;
@@ -880,23 +997,94 @@ int TableStore::write(const Array<Clause>& columns, const Array<Clauses>& clause
 // ─── Remove ─────────────────────────────────────────────────────────────────
 
 bool TableStore::remove(const Array<Clauses>& clauses, u64 length) {
-    invalidateColHashIndex();
     Array<u64> toRemove;
-    for (u64 rId : allRowIds) {
-        Map<String, String>* row = fetchRow(rId);
-        if (!row) continue;
-        if (evaluateClauses(*row, clauses) >= 0.0f) {
-            toRemove.push(rId);
+    Array<u64> candidateIds;
+    bool fastPathUsed = false;
+    if (clauses.size() == 1) { 
+        bool allEq = true;
+        for (const auto& c : clauses[0]) {
+            if (c.op != "=") { allEq = false; break; }
+            if (c.val.startsWith("parent.")) { allEq = false; break; } 
+        }
+        if (allEq && clauses[0].size() > 0 && !clauses[0].isAssert && !disableIndex) {
+            if (colHashIndexDirty) rebuildColHashIndex();
+            
+            bool impossible = false;
+            bool firstCol = true;
+            for (const auto& c : clauses[0]) {
+                auto* valMap = colHashIndex.get(c.col);
+                if (!valMap) { impossible = true; break; } 
+                
+                auto* rowIds = valMap->get(c.val);
+                if (!rowIds) { impossible = true; break; } 
+                
+                if (firstCol) {
+                    candidateIds = *rowIds;
+                    firstCol = false;
+                } else {
+                    Array<u64> intersected;
+                    for (u64 rId : *rowIds) {
+                        for (u64 crId : candidateIds) {
+                            if (rId == crId) { intersected.push(rId); break; }
+                        }
+                    }
+                    candidateIds = intersected;
+                    if (candidateIds.size() == 0) { impossible = true; break; }
+                }
+            }
+            if (!impossible) {
+                fastPathUsed = true;
+            }
+        }
+    }
+
+    if (fastPathUsed) {
+        for (u64 rId : candidateIds) {
+            Map<String, String>* row = fetchRow(rId);
+            if (!row) continue;
+            if (evaluateClauses(*row, clauses) >= 0.0f) {
+                toRemove.push(rId);
+            }
+        }
+    } else {
+        for (u64 rId : allRowIds) {
+            Map<String, String>* row = fetchRow(rId);
+            if (!row) continue;
+            if (evaluateClauses(*row, clauses) >= 0.0f) {
+                toRemove.push(rId);
+            }
         }
     }
     for (usz i = 0; i < toRemove.size(); ++i) {
         u64 rId = toRemove[i];
-        if (allRows.has(rId)) {
-            Map<String, String>* row = allRows.get(rId);
-            
+        Map<String, String>* row = fetchRow(rId);
+        if (row) {
             // Remove from HNSW if it has embedding
             if (row->has("embedding") && hnsw) {
                 hnsw->remove(rId);
+            }
+            
+            // Cleanup from colHashIndex
+            if (!colHashIndexDirty) {
+                for (auto it = row->begin(); it != row->end(); ++it) {
+                    if (it->key == "content" || it->value.size() > 256) continue;
+                    String val = it->value;
+                    if (globalKeys) val = CryptItem::decrypt(val, *globalKeys);
+                    
+                    if (colHashIndex.has(it->key)) {
+                        auto* valMap = colHashIndex.get(it->key);
+                        if (valMap->has(val)) {
+                            auto* rowIds = valMap->get(val);
+                            for (usz j = 0; j < rowIds->size(); ++j) {
+                                if ((*rowIds)[j] == rId) {
+                                    (*rowIds)[j] = (*rowIds)[rowIds->size() - 1];
+                                    rowIds->pop();
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
             }
             
             // Cleanup blob references
@@ -986,14 +1174,21 @@ Collection::TreeBranch* TableStore::graphRead(const Array<String>& columns, cons
         } else if (op.type == GraphOpType::FOLLOW) {
             Array<RowNode*> nextActive;
             bool fastPath = false;
-            if (op.query.size() == 1 && op.query[0].size() == 1) {
-                if (op.query[0][0].op == "=" && op.query[0][0].val.startsWith("parent.")) fastPath = true;
+            long long fastClauseIdx = -1;
+            if (op.query.size() == 1) {
+                for (usz ci = 0; ci < op.query[0].size(); ++ci) {
+                    if (op.query[0][ci].op == "=" && op.query[0][ci].val.startsWith("parent.")) {
+                        fastPath = true;
+                        fastClauseIdx = (long long)ci;
+                        break;
+                    }
+                }
             }
             
-            if (fastPath) {
+            if (fastPath && !disableIndex) {
                 if (colHashIndexDirty) rebuildColHashIndex();
-                String targetCol = op.query[0][0].col;
-                String parentKey = op.query[0][0].val.substring(7);
+                String targetCol = op.query[0][fastClauseIdx].col;
+                String parentKey = op.query[0][fastClauseIdx].val.substring(7);
                 
                 auto* valMap = colHashIndex.get(targetCol);
                 
@@ -1047,16 +1242,23 @@ Collection::TreeBranch* TableStore::graphRead(const Array<String>& columns, cons
             for (RowNode* n : currentLevel) visited.set(n->rId, true);
             
             bool fastPath = false;
-            if (op.query.size() == 1 && op.query[0].size() == 1) {
-                if (op.query[0][0].op == "=" && op.query[0][0].val.startsWith("parent.")) fastPath = true;
+            long long fastClauseIdx = -1;
+            if (op.query.size() == 1) {
+                for (usz ci = 0; ci < op.query[0].size(); ++ci) {
+                    if (op.query[0][ci].op == "=" && op.query[0][ci].val.startsWith("parent.")) {
+                        fastPath = true;
+                        fastClauseIdx = (long long)ci;
+                        break;
+                    }
+                }
             }
             
             while (currentLevel.size() > 0) {
                 Array<RowNode*> nextLevel;
-                if (fastPath) {
+                if (fastPath && !disableIndex) {
                     if (colHashIndexDirty) rebuildColHashIndex();
-                    String targetCol = op.query[0][0].col;
-                    String parentKey = op.query[0][0].val.substring(7);
+                    String targetCol = op.query[0][fastClauseIdx].col;
+                    String parentKey = op.query[0][fastClauseIdx].val.substring(7);
                     auto* valMap = colHashIndex.get(targetCol);
                     
                     for (RowNode* node : currentLevel) {
@@ -1142,14 +1344,21 @@ int TableStore::graphWrite(const Array<GraphOp>& ops, const String& encryptionKe
         } else if (op.type == GraphOpType::FOLLOW) {
             Array<u64> nextActive;
             bool fastPath = false;
-            if (op.query.size() == 1 && op.query[0].size() == 1) {
-                if (op.query[0][0].op == "=" && op.query[0][0].val.startsWith("parent.")) fastPath = true;
+            long long fastClauseIdx = -1;
+            if (op.query.size() == 1) {
+                for (usz ci = 0; ci < op.query[0].size(); ++ci) {
+                    if (op.query[0][ci].op == "=" && op.query[0][ci].val.startsWith("parent.")) {
+                        fastPath = true;
+                        fastClauseIdx = (long long)ci;
+                        break;
+                    }
+                }
             }
             
-            if (fastPath) {
+            if (fastPath && !disableIndex) {
                 if (colHashIndexDirty) rebuildColHashIndex();
-                String targetCol = op.query[0][0].col;
-                String parentKey = op.query[0][0].val.substring(7);
+                String targetCol = op.query[0][fastClauseIdx].col;
+                String parentKey = op.query[0][fastClauseIdx].val.substring(7);
                 auto* valMap = colHashIndex.get(targetCol);
                 
                 for (u64 parentId : activeIds) {
@@ -1201,16 +1410,23 @@ int TableStore::graphWrite(const Array<GraphOp>& ops, const String& encryptionKe
             for (u64 id : currentLevel) visited.set(id, true);
             
             bool fastPath = false;
-            if (op.query.size() == 1 && op.query[0].size() == 1) {
-                if (op.query[0][0].op == "=" && op.query[0][0].val.startsWith("parent.")) fastPath = true;
+            long long fastClauseIdx = -1;
+            if (op.query.size() == 1) {
+                for (usz ci = 0; ci < op.query[0].size(); ++ci) {
+                    if (op.query[0][ci].op == "=" && op.query[0][ci].val.startsWith("parent.")) {
+                        fastPath = true;
+                        fastClauseIdx = (long long)ci;
+                        break;
+                    }
+                }
             }
             
             while (currentLevel.size() > 0) {
                 Array<u64> nextLevel;
-                if (fastPath) {
+                if (fastPath && !disableIndex) {
                     if (colHashIndexDirty) rebuildColHashIndex();
-                    String targetCol = op.query[0][0].col;
-                    String parentKey = op.query[0][0].val.substring(7);
+                    String targetCol = op.query[0][fastClauseIdx].col;
+                    String parentKey = op.query[0][fastClauseIdx].val.substring(7);
                     auto* valMap = colHashIndex.get(targetCol);
                     
                     for (u64 parentId : currentLevel) {
@@ -1343,12 +1559,12 @@ void TableStore::serializeBlock(u64 blockId, String& out) {
     u64 endId = startId + 1000;
     
     Array<u64> rowIds;
+    Map<u64, bool> existMap;
+    for (usz j = 0; j < allRowIds.size(); ++j) {
+        existMap.set(allRowIds[j], true);
+    }
     for (u64 rId = startId; rId < endId; ++rId) {
-        bool exists = false;
-        for (usz j = 0; j < allRowIds.size(); ++j) {
-            if (allRowIds[j] == rId) { exists = true; break; }
-        }
-        if (exists && !volatileRows.has(rId)) {
+        if (existMap.has(rId) && !volatileRows.has(rId)) {
             rowIds.push(rId);
         }
     }
@@ -1473,13 +1689,16 @@ void TableStore::deserializeBlock(u64 blockId, const String& in) {
     
     Array<u64> rowIds;
     rowIds.allocate(rowCount);
+    Map<u64, bool> existMap;
+    for (usz j = 0; j < allRowIds.size(); ++j) {
+        existMap.set(allRowIds[j], true);
+    }
     for (u32 i = 0; i < rowCount; ++i) {
         rowIds[i] = rowStartIndex + i;
-        bool exists = false;
-        for (usz j = 0; j < allRowIds.size(); ++j) {
-            if (allRowIds[j] == rowIds[i]) { exists = true; break; }
+        if (!existMap.has(rowIds[i])) {
+            allRowIds.push(rowIds[i]);
+            existMap.set(rowIds[i], true);
         }
-        if (!exists) allRowIds.push(rowIds[i]);
     }
     
     Array<Map<String, String>> rows;
