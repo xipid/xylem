@@ -1,0 +1,39 @@
+{
+  "name": "Xylem",
+  "version": "1.0.0",
+  "description": "The Multi-Model Embedded Database Engine designed for Flash Memory, Graph Traversal, CAS Blobs, and HNSW Vector Search.",
+  "keywords": [
+    "database",
+    "embedded",
+    "vector-search",
+    "hnsw",
+    "graph-database",
+    "mvcc",
+    "blob-store",
+    "cas",
+    "esp32",
+    "flash",
+    "wear-leveling"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/xipid/xylem.git"
+  },
+  "authors": [
+    {
+      "name": "xipid Contributors"
+    }
+  ],
+  "license": "Apache-2.0",
+  "frameworks": "*",
+  "platforms": "*",
+  "headers": [
+    "include"
+  ],
+  "build": {
+    "flags": [
+      "-Iinclude",
+      "-std=c++17"
+    ]
+  }
+}
