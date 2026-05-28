@@ -1,7 +1,7 @@
 {
   "name": "Xylem",
   "version": "1.0.0",
-  "description": "The Multi-Model Embedded Database Engine designed for Flash Memory, Graph Traversal, CAS Blobs, and HNSW Vector Search.",
+  "description": "The Multi-Model Embedded Database Engine designed for Flash Memory, Graph Traversal, CAS Blobs, Pub/Sub Reactivity, MVCC Transactions, and HNSW Vector Search.",
   "keywords": [
     "database",
     "embedded",
@@ -11,9 +11,17 @@
     "mvcc",
     "blob-store",
     "cas",
+    "pubsub",
+    "reactivity",
+    "query-language",
+    "cli",
+    "transactions",
+    "nosql",
+    "sql",
     "esp32",
     "flash",
-    "wear-leveling"
+    "wear-leveling",
+    "storage"
   ],
   "repository": {
     "type": "git",

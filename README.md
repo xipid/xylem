@@ -7,21 +7,46 @@
 
 ---
 
-Xylem is a lightweight, zero-dependency, serverless database engine written in C++17. Designed to run on everything from constrained microcontrollers (like ESP32 using raw SPI flash) to full-scale Linux application backends, Xylem collapses the boundary between different storage paradigms. 
+Xylem is a lightweight, zero-dependency, serverless database engine written in C++17. Designed to run on everything from constrained microcontrollers (like ESP32 using raw SPI flash) to full-scale Linux application backends, Xylem collapses the boundary between different storage paradigms.
 
-Instead of combining **SQLite** (relational), **littlefs** (raw block/wear-leveling storage), **FAISS** (vector similarity), and **tar/zip** (file packaging), you can use Xylem to manage it all in one cohesive format.
+Instead of combining **SQLite** (relational), **littlefs** (raw block/wear-leveling storage), **FAISS** (vector similarity), and **tar/zip** (file packaging), you can use Xylem to manage it all in one cohesive, multi-model format.
 
 ---
 
-## ⚡ Super Features
+## ⚡ Super Features: Every Taste of Xylem
 
-*   **💾 Raw Block Device Engine:** Wear-leveling and dynamic, wandering superblocks mean you can run Xylem on raw NOR flash without a filesystem partition table.
-*   **🧠 Embedded Vector DB (HNSW):** Hierarchical Navigable Small World graphs persisted to disk, offering Top-K cosine similarity searches on-demand.
-*   **🔗 Graph Traversal Engine:** Native graph pathing using custom query pipelines (`MATCH`, `FOLLOW`, `REPEATFOLLOW`, `UNTIL`).
-*   **🛡️ Multi-Version Concurrency Control (MVCC):** Complete transactional isolation with atomic locks, rollbacks, and write-write conflict detection.
-*   **📦 CAS Blob Deduplication:** Zero-overhead storage using Blake2b-128 Content Addressable Storage, supporting partial updates (`blob[+]` or `blob[offset:len]`).
-*   **🔔 Reactive Pub/Sub:** Watch queries to trigger real-time callbacks on writes, or use ephemeral `VIRTUAL` columns for zero-disk message passing.
-*   **🔑 Multi-Key Security:** On-the-fly encryption and decryption utilizing multiple global secure keys.
+Xylem provides a complete suite of storage, query, and relational capabilities, giving you all the tools of an enterprise database in a micro-footprint.
+
+### 💾 1. Raw Block Engine & Flash Optimizations
+*   **Zero-Overhead Wear Leveling:** Operates directly on block devices or raw NOR flash without a filesystem partition table.
+*   **Wandering Superblocks:** Prevents block burn-out by dynamically relocating critical metadata.
+*   **Automatic Vacuuming:** Shrinks files dynamically and reclaims empty tail-end space efficiently.
+*   **Memory Swapping:** Use `WRITEVOLATILE` to seamlessly drop ephemeral memory onto the block device like a swap file, which auto-clears on restart.
+
+### 🧠 2. Embedded Vector DB (HNSW)
+*   **On-Disk HNSW Graphs:** State-of-the-art Hierarchical Navigable Small World graphs stored directly on the block device.
+*   **AI Edge Ready:** Perform instant Top-K cosine similarity searches on 128/256/512+ dimension embeddings locally.
+
+### 🔗 3. Graph Traversal Engine
+*   **Native Graph Pathing:** Relational matching using highly optimized graph pipelines (`MATCH`, `FOLLOW`, `REPEATFOLLOW`, `UNTIL`).
+*   **Batch Graph Mutations:** Update or remove entire relational trees instantaneously with `GRAPHWRITE ... SET/REMOVE`.
+*   **VFS Macros:** Built-in Virtual File System syntax to `EXTRACT`, `CAT`, `TEE`, and ingest tree-like folder structures.
+
+### 🛡️ 4. Multi-Version Concurrency Control (MVCC)
+*   **ACID Compliance:** Transactional isolation preventing write-write conflicts.
+*   **Pessimistic Locks & Snapshots:** Lock rows instantly for massive bulk operations, with instant rollback support via `ROLLBACK <txId>`.
+
+### 📦 5. CAS Blob Deduplication
+*   **Blake2b-128 Hashing:** Content Addressable Storage ensures identical blobs (files/assets) are only stored once on the disk.
+*   **Blob Freezing/Thawing:** Use `FREEZE <pos>` to bypass copy-on-write overheads and lock binaries directly to flash addresses (e.g. for ESP32 bootloaders!).
+
+### 🔔 6. Reactive Pub/Sub & Watchers
+*   **Query Watchers:** Set up native callbacks via `WATCH WHERE ...` to trigger real-time updates when matching data is mutated.
+*   **Virtual Ephemeral Columns:** Pass zero-disk messages instantly through the database engine without invoking the block allocator.
+
+### 🛠️ 7. Unified Query Language & CLI
+*   **Interactive REPL:** Use the `xy` binary as a full-fledged SQL-like shell to manage your database.
+*   **Unified Syntax:** Perform CRUD (`READ`, `WRITE`), Graph Traversals (`GRAPHREAD`), Pub/Sub (`PULL`, `WATCH`), and Admin tasks (`VACUUM`, `DESTROY`) from a single language.
 
 ---
 
@@ -34,7 +59,18 @@ lib_deps =
     xipid/Xylem
 ```
 
-### Simple Row CRUD
+### 1. Launching the CLI
+Xylem provides a built-in shell for rapid prototyping.
+```bash
+./build/xy dev/db.xy
+```
+```sql
+> WRITE name=Alice role=Engineer id:generate=0
+> GRAPHREAD id MATCH name=Alice FOLLOW reports_to=parent.id
+> VACUUM
+```
+
+### 2. Simple C++ Row CRUD
 ```cpp
 #include <Xylem/Xylem.hpp>
 
@@ -60,7 +96,7 @@ auto results = xm.read({"name", "role"}, {WHERE("role", "=", "Engineer")});
 // Results contain: [{"name": "Alice", "role": "Engineer"}]
 ```
 
-### High-Performance Vector Similarity Search
+### 3. High-Performance Vector Similarity Search
 ```cpp
 // Generate a 128-dimensional embedding
 String queryVec;
@@ -80,10 +116,11 @@ auto topMatches = xm.read({"id"}, {WHERE("embedding", "cos", queryVec)}, 5);
 │   ├── Xylem.hpp       # Main database engine
 │   ├── HNSW.hpp        # HNSW vector database logic
 │   ├── TableStore.hpp  # Relational/document storage
-│   └── BlobStore.hpp   # CAS Blob store
+│   ├── BlobStore.hpp   # CAS Blob store
+│   └── QueryParser.hpp # Unified Query Language
 ├── src/Xylem/          # Implementation files
+├── src/xy.cpp          # Interactive CLI Runner
 ├── tests/              # Comprehensive test suites
-├── dev/                # Development plans & specifications
 └── docs/               # GitBook documentation files
 ```
 
