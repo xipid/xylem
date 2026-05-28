@@ -44,6 +44,15 @@ If you encounter an error or want to cancel the changes, discard the transaction
 xm.rollback(txId);
 ```
 
+## Pessimistic Locks (Seamless Snapshots)
+If you need to guarantee that no other queries alter the database during your transaction (creating a seamless snapshot for backups, consistent state reads, or strict exclusive operations), you can pass `requiresExplicitAs = true` when locking:
+
+```cpp
+u64 snapId = xm.lock(Array<Clauses>(), 0, true /* requiresExplicitAs */);
+```
+
+When this flag is set, **every** modifying operation (e.g., `write`, `remove`, `graphWrite`) on the database must explicitly pass this `snapId`. Any queries attempting to bypass the lock (passing `txId = 0` or another `txId`) will be immediately blocked and return `-1`. This effectively freezes the database for all clients except the lock holder.
+
 ---
 
 ## ASSERT Queries

@@ -1,4 +1,5 @@
 #include <Xylem/Xylem.hpp>
+#include <Xi/Random.hpp>
 #include <Sec/Crypto.hpp>
 #include <stdint.h>
 #include <stdio.h>
@@ -248,6 +249,9 @@ bool XylemEngine::mount() {
     blobStore->loadPendingFreezes();
     // Wire up BlobStore pointer in TableStore
     tableStore->blobStore = blobStore;
+    blobStore->thawCallback = [this](u64 start, u64 end) {
+        this->thaw(start, end);
+    };
 
     auto writeVLU = [](u8*& ptr, u64 val) {
         while (val >= 0x80) { *ptr++ = (val & 0x7F) | 0x80; val >>= 7; }
@@ -370,6 +374,17 @@ bool XylemEngine::mount() {
 
     tableStore->loadSchemas();
     journal->recover(tableStore);
+
+    // Purge Volatile SWAP blocks on boot
+    Array<String> volatileBlobsToPurge;
+    for (auto it = blobStore->index.begin(); it != blobStore->index.end(); ++it) {
+        if (it->key.startsWith("VOLATILE_BLOCK_")) {
+            volatileBlobsToPurge.push(it->key);
+        }
+    }
+    for (usz i = 0; i < volatileBlobsToPurge.size(); ++i) {
+        blobStore->removeHash(volatileBlobsToPurge[i]);
+    }
 
     cache   = new Cache(device, maxCache);
     watcher = new Watcher(tableStore);
@@ -712,6 +727,26 @@ bool XylemEngine::fixRaw(u64 byteAddress, const String& rawData) {
 
 // ─── Query Parser ────────────────────────────────────────────────────────────
 
+String XylemEngine::generateId(const String& column) {
+    if (!Xi::_randomInitialized) {
+        Xi::randomSeed(true);
+    }
+    
+    while (true) {
+        u64 part1 = Xi::randomNext();
+        u64 part2 = Xi::randomNext();
+        u64 rId = (part1 << 32) | part2;
+        String idStr = String::from(rId);
+        
+        Array<String> cols; cols.push("id");
+        Array<Clauses> query; query.push(WHERE(column, "=", idStr));
+        auto result = read(cols, query, 1);
+        if (result.size() == 0) {
+            return idStr;
+        }
+    }
+}
+
 QueryResult XylemEngine::query(const String& queryString, const Array<String>& sanitized) {
     ensureMounted();
     return QueryParser::execute(this, queryString, sanitized);
@@ -731,8 +766,19 @@ Array<Map<String,String>> XylemEngine::read(const Array<String>& columns, const 
     return tableStore->read(columns, clauses, length, tombstones, snapshotSeq, txId);
 }
 
+bool XylemEngine::isWriteBlocked(u64 txId) {
+    if (!journal) return false;
+    for (auto it = journal->activeLocks.begin(); it != journal->activeLocks.end(); ++it) {
+        if (it->value.requiresExplicitAs && it->key != txId) {
+            return true;
+        }
+    }
+    return false;
+}
+
 int XylemEngine::write(const Array<Clause>& columns, const Array<Clauses>& clauses, u64 txId, const String& encryptionKey) {
     ensureMounted();
+    if (isWriteBlocked(txId)) return -1;
     if (txId != 0) {
         if (!journal) return -1;
         auto* ls = journal->activeLocks.get(txId);
@@ -774,10 +820,11 @@ int XylemEngine::write(const Array<Clause>& columns, const Array<Clauses>& claus
     return result;
 }
 
-int XylemEngine::writeVolatile(const Array<Clause>& columns, const Array<Clauses>& clauses, const String& encryptionKey) {
+int XylemEngine::writeVolatile(const Array<Clause>& columns, const Array<Clauses>& clauses, u64 txId, const String& encryptionKey) {
     ensureMounted();
+    if (isWriteBlocked(txId)) return -1;
     if (!tableStore) return -1;
-    // Bypass journal entirely (txId = 0) and flag as volatile
+    // Bypass journal entirely and flag as volatile
     int result = tableStore->write(columns, clauses, encryptionKey, 0, true);
     if (result == 0 && watcher) {
         Map<String, String> mockRow;
@@ -805,6 +852,7 @@ Collection::TreeBranch* XylemEngine::graphRead(const Array<String>& columns, con
 
 int XylemEngine::graphWrite(const Array<GraphOp>& ops, u64 txId, const String& encryptionKey) {
     ensureMounted();
+    if (isWriteBlocked(txId)) return -1;
     if (txId != 0) {
         if (!tableStore) return -1;
         return tableStore->graphWrite(ops, encryptionKey, txId);
@@ -818,15 +866,17 @@ int XylemEngine::graphWrite(const Array<GraphOp>& ops, u64 txId, const String& e
     return r;
 }
 
-int XylemEngine::graphWriteVolatile(const Array<GraphOp>& ops, const String& encryptionKey) {
+int XylemEngine::graphWriteVolatile(const Array<GraphOp>& ops, u64 txId, const String& encryptionKey) {
     ensureMounted();
+    if (isWriteBlocked(txId)) return -1;
     int r = tableStore->graphWrite(ops, encryptionKey, 0, true);
     // Volatile writes don't get logged to Journal or flushed immediately
     return r;
 }
 
-bool XylemEngine::remove(const Array<Clauses>& clauses, u64 length, u64 /*as*/) {
+bool XylemEngine::remove(const Array<Clauses>& clauses, u64 length, u64 as) {
     ensureMounted();
+    if (isWriteBlocked(as)) return false;
     bool ok = tableStore->remove(clauses, length);
     if (ok) {
         String payload = Journal::serializeTableRemove(clauses, length);
@@ -838,10 +888,10 @@ bool XylemEngine::remove(const Array<Clauses>& clauses, u64 length, u64 /*as*/) 
 
 // ─── Transactions (MVCC) ─────────────────────────────────────────────────────
 
-u64 XylemEngine::lock(const Array<Clauses>& clauses, u64 /*id*/) {
+u64 XylemEngine::lock(const Array<Clauses>& clauses, u64 /*id*/, bool requiresExplicitAs) {
     ensureMounted();
     if (!journal) return 0;
-    u64 txId = journal->lockBegin();
+    u64 txId = journal->lockBegin(requiresExplicitAs);
     if (tableStore) {
         auto* ls = journal->activeLocks.get(txId);
         if (ls) ls->snapshotSeq = tableStore->currentSeq;
@@ -962,7 +1012,73 @@ u32 XylemEngine::getBlobSize(u32 ref) {
 
 void XylemEngine::writeBlob(u32 ref, const String& content, u64 start) {
     ensureMounted();
-    if (blobStore) blobStore->writeBlob(ref, content, start);
+    if (!blobStore) return;
+    auto* hashPtr = blobStore->refToHash.get(ref);
+    if (!hashPtr) return;
+    String hash = *hashPtr;
+    auto* m = blobStore->index.get(hash);
+    
+    if (m && m->frozen && m->fixedPosition != 0) {
+        u64 oldSize = m->originalSize;
+        u64 newSize = start + content.size();
+        if (oldSize > newSize) newSize = oldSize;
+        
+        u32 blockSize = device->config.blockSize;
+        u32 oldBlocks = (u32)((oldSize + blockSize - 1) / blockSize);
+        u32 newBlocks = (u32)((newSize + blockSize - 1) / blockSize);
+        
+        if (newBlocks > oldBlocks) {
+            u64 startPos = m->fixedPosition + oldBlocks * blockSize;
+            u64 endPos = m->fixedPosition + newBlocks * blockSize;
+            vaccum(startPos, endPos);
+            freeze(startPos, endPos);
+        }
+        
+        // Update size in metadata
+        m->originalSize = newSize;
+        m->length = newSize; // Ensure we keep track
+        
+        u32 startBlock = (u32)(m->fixedPosition / blockSize);
+        u32 endBlock = (u32)((m->fixedPosition + newSize + blockSize - 1) / blockSize);
+        u32 written = 0;
+        
+        String data = blobStore->readHash(hash, 0, 0xFFFFFFFF);
+        if (start + content.size() > data.size()) {
+            String newData; newData.allocate(newSize);
+            newData.fill(0);
+            for (usz i = 0; i < data.size(); ++i) newData[i] = data[i];
+            for (usz i = 0; i < content.size(); ++i) newData[start + i] = content[i];
+            data = newData;
+        } else {
+            for (usz i = 0; i < content.size(); ++i) data[start + i] = content[i];
+        }
+        
+        for (u32 b = startBlock; b < endBlock; ++b) {
+            u16 ec = (allocator && b < allocator->bam.size()) ? allocator->bam[b].eraseCount : 0u;
+            u32 blockOffset = 0;
+            if (b == startBlock) blockOffset = (u32)(m->fixedPosition % blockSize);
+            
+            String blk; blk.allocate(blockSize); blk.fill(0xFF);
+            if (blockOffset > 0 || (written + blockSize - blockOffset > newSize)) {
+                blk = device->readBlock(b, ec); // Read-modify-write for partial blocks
+            }
+            
+            u32 toCopy = blockSize - blockOffset;
+            if (written + toCopy > newSize) toCopy = newSize - written;
+            
+            for (u32 i = 0; i < toCopy; ++i) {
+                blk[blockOffset + i] = data[written++];
+            }
+            
+            device->writeBlock(b, ec, blk);
+            if (allocator && b < allocator->bam.size()) {
+                allocator->bam[b].setStatus(BlockStatus::USED);
+                allocator->bam[b].setType(BlockType::RAW);
+            }
+        }
+    } else {
+        blobStore->writeBlob(ref, content, start);
+    }
 }
 
 String XylemEngine::readBlob(u32 ref, u64 start, u64 end) {
@@ -982,7 +1098,14 @@ String XylemEngine::setBlob(u32 ref) {
 
 bool XylemEngine::freezeBlob(u64 position, u32 blobRef) {
     ensureMounted();
-    return blobStore ? blobStore->freezeBlob(position, blobRef) : false;
+    if (!blobStore) return false;
+    
+    u32 size = blobStore->getBlobSize(blobRef);
+    if (size > 0) {
+        vaccum(position, position + size);
+    }
+    
+    return blobStore->freezeBlob(position, blobRef);
 }
 
 void XylemEngine::thawBlob(u32 blobRef) {

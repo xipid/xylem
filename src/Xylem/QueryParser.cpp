@@ -342,8 +342,19 @@ QueryResult QueryParser::execute(XylemEngine* engine, const String& queryStr, co
         }
         
         if (isWrite) {
+            for (usz i = 0; i < ops.size(); ++i) {
+                if (ops[i].type == GraphOpType::SET) {
+                    for (usz j = 0; j < ops[i].writeSet.size(); ++j) {
+                        if (ops[i].writeSet[j].col.endsWith(":generate")) {
+                            String baseCol = ops[i].writeSet[j].col.substring(0, ops[i].writeSet[j].col.size() - 9);
+                            ops[i].writeSet[j].col = baseCol;
+                            ops[i].writeSet[j].val = engine->generateId(baseCol);
+                        }
+                    }
+                }
+            }
             if (isVolatile) {
-                res.code = engine->graphWriteVolatile(ops, "");
+                res.code = engine->graphWriteVolatile(ops, 0, "");
             } else {
                 res.code = engine->graphWrite(ops, 0, "");
             }
@@ -406,10 +417,19 @@ QueryResult QueryParser::execute(XylemEngine* engine, const String& queryStr, co
         if (cmd == "READ") {
             res.readRows = engine->read(columns, queryClauses);
             res.code = res.readRows.size();
-        } else if (cmd == "WRITE") {
-            res.code = engine->write(writeCols, queryClauses);
-        } else if (cmd == "WRITEVOLATILE") {
-            res.code = engine->writeVolatile(writeCols, queryClauses);
+        } else if (cmd == "WRITE" || cmd == "WRITEVOLATILE") {
+            for (usz i = 0; i < writeCols.size(); ++i) {
+                if (writeCols[i].col.endsWith(":generate")) {
+                    String baseCol = writeCols[i].col.substring(0, writeCols[i].col.size() - 9);
+                    writeCols[i].col = baseCol;
+                    writeCols[i].val = engine->generateId(baseCol);
+                }
+            }
+            if (cmd == "WRITE") {
+                res.code = engine->write(writeCols, queryClauses);
+            } else {
+                res.code = engine->writeVolatile(writeCols, queryClauses);
+            }
         } else if (cmd == "REMOVE") {
             res.code = engine->remove(queryClauses) ? 0 : -1;
         }

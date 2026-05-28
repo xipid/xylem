@@ -31,8 +31,32 @@ String BlobStore::readHash(const String& hash, u64 minOffset, u64 maxOffset) {
     if (!m) return String();
 
     String data;
-    if (device && device->config.onDeviceRead && m->blockIdx != 0) {
-        data = readChain(m->blockIdx);
+    if (device && device->config.onDeviceRead) {
+        if (m->frozen && m->fixedPosition != 0) {
+            u32 blockSize = device->config.blockSize;
+            u32 startBlock = (u32)(m->fixedPosition / blockSize);
+            u32 endBlock = (u32)((m->fixedPosition + m->originalSize + blockSize - 1) / blockSize);
+            data.allocate(m->originalSize);
+            u32 written = 0;
+            for (u32 b = startBlock; b < endBlock && written < m->originalSize; ++b) {
+                u16 ec = (allocator && b < allocator->bam.size()) ? allocator->bam[b].eraseCount : 0u;
+                String blk = device->readBlock(b, ec);
+                
+                u32 blockOffset = 0;
+                if (b == startBlock) blockOffset = (u32)(m->fixedPosition % blockSize);
+                
+                u32 toCopy = blockSize - blockOffset;
+                if (written + toCopy > m->originalSize) toCopy = m->originalSize - written;
+                
+                for (u32 i = 0; i < toCopy && blockOffset + i < blk.size(); ++i) {
+                    data[written++] = blk[blockOffset + i];
+                }
+            }
+        } else if (m->blockIdx != 0) {
+            data = readChain(m->blockIdx);
+        } else {
+            return String();
+        }
     } else {
         return String(); // No device or invalid block
     }
@@ -190,7 +214,9 @@ bool BlobStore::removeHash(const String& hash) {
     if (!m) return false;
 
     // Free the entire block chain
-    if (device && allocator && m->blockIdx != 0) {
+    if (m->frozen && m->fixedPosition != 0) {
+        if (thawCallback) thawCallback(m->fixedPosition, m->fixedPosition + m->originalSize);
+    } else if (device && allocator && m->blockIdx != 0) {
         u32 blockIdx = m->blockIdx;
         while (blockIdx != 0) {
             String blockData = device->readBlock(
@@ -223,28 +249,50 @@ bool BlobStore::fixBlob(const String& hash, u64 byteAddress) {
     auto* m = index.get(hash);
     if (!m || !device || !allocator) return false;
 
-    u32 targetBlock = (u32)(byteAddress / device->config.blockSize);
-    if (targetBlock >= allocator->bam.size()) return false;
+    u32 blockSize = device->config.blockSize;
+    u32 startBlock = (u32)(byteAddress / blockSize);
+    u32 requiredBlocks = (m->originalSize + blockSize - 1) / blockSize;
 
-    // If already there, nothing to do
-    if (m->blockIdx == targetBlock) return true;
+    if (startBlock + requiredBlocks > allocator->bam.size()) return false;
 
-    // Free the target block if occupied
-    if (allocator->bam[targetBlock].getStatus() == BlockStatus::USED) {
-        allocator->freeBlock(targetBlock);
+    // Read the entire blob contents first
+    String data = readHash(hash, 0, 0xFFFFFFFF);
+    if (data.isEmpty() && m->originalSize > 0) return false;
+
+    // Save old meta before removing
+    u32 ref = m->ref;
+    bool used = m->used;
+
+    // Free the old blocks
+    removeHash(hash);
+
+    // Write the raw bytes directly to the fixed position
+    u32 written = 0;
+    for (u32 b = startBlock; b < startBlock + requiredBlocks; ++b) {
+        u16 ec = allocator->bam[b].eraseCount;
+        u32 blockOffset = 0;
+        if (b == startBlock) blockOffset = (u32)(byteAddress % blockSize);
+        
+        String blk; blk.allocate(blockSize); blk.fill(0xFF);
+        if (blockOffset > 0 || (written + blockSize - blockOffset > data.size())) {
+            blk = device->readBlock(b, ec);
+        }
+        
+        u32 toCopy = blockSize - blockOffset;
+        if (written + toCopy > data.size()) toCopy = data.size() - written;
+        
+        for (u32 i = 0; i < toCopy; ++i) {
+            blk[blockOffset + i] = data[written++];
+        }
+        
+        device->writeBlock(b, ec, blk);
+        allocator->bam[b].setStatus(BlockStatus::USED);
+        allocator->bam[b].setType(BlockType::RAW);
     }
 
-    // Free the old chain, then re-write the blob to the (now free) target area
-    String data = readChain(m->blockIdx);
-    if (data.isEmpty()) return false;
-
-    // Remove old to free old blocks
-    index.remove(hash);
-
-    // Force-allocate target block by temporarily marking others
-    // Simple approach: just re-write; allocBlock may not give exactly targetBlock
-    // so we swap if needed.
-    writeHash(hash, 0, data, "");
+    BlobMeta meta = { 0, 0, (u32)data.size(), (u32)data.size(), byteAddress, ref, true, used };
+    index.set(hash, meta);
+    bloomInsert(hash);
     return true;
 }
 

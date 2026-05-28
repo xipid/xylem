@@ -65,3 +65,22 @@ auto dbCheck = xm.read({}, {WHERE("_type", "=", "command")});
 assert(dbCheck.size() == 0); 
 ```
 This is ideal for message passing and inter-task communications in embedded systems.
+
+---
+
+## Volatile Write Operations (Disk-Backed SWAP)
+Unlike `:virtual` columns which are completely transient, sometimes you need structured rows to be fully queryable, indexable, and accessible throughout the runtime lifecycle of the application—but they **should not** be persisted permanently across device reboots.
+
+For this, use `WRITEVOLATILE` (in queries) or `xm.writeVolatile(cols, clauses)`.
+
+```cpp
+// Write a session token that expires if the device reboots
+xm.writeVolatile({
+    {"type", "=", "session"},
+    {"token", "=", "abc-123"}
+});
+```
+
+### Automatic SWAP Offloading
+To prevent RAM exhaustion, Xylem tracks volatile rows in an in-memory B+ Tree layer. If memory fills up, Xylem seamlessly writes the oldest volatile chunks into **temporary disk-backed SWAP files (`VOLATILE_BLOCK_`)** in the Blob Store.
+When Xylem boots up (mounts), it intentionally drops these volatile structures and deletes any lingering `VOLATILE_BLOCK_` chunks from flash, restoring your device to a clean baseline state.

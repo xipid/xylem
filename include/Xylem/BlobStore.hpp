@@ -6,6 +6,7 @@
 #include <Xylem/Allocator.hpp>
 #include <LLT/Compression.hpp>
 #include <Collection/Map.hpp>
+#include <Xi/Func.hpp>
 
 namespace Xylem {
 
@@ -67,6 +68,8 @@ public:
 #endif
 
     Array<String>* globalKeys;
+    
+    Xi::Func<void(u64, u64)> thawCallback;
 
     // Bloom filter: 3 hashes derived from BLAKE2b-128 (bytes 0-7, 8-15, XOR)
     // Size: 10 bits per entry, false-positive rate < 1%

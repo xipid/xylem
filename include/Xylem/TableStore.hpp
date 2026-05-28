@@ -162,8 +162,8 @@ public:
 
     Map<u64, bool> dirtyBlocks;
     bool loadBlock(u64 blockId);
-    void serializeBlock(u64 blockId, String& out);
-    void deserializeBlock(u64 blockId, const String& in);
+    void serializeBlock(u64 blockId, String& out, bool volatileOnly = false);
+    void deserializeBlock(u64 blockId, const String& in, bool isVolatile = false);
 
 private:
 };

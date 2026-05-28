@@ -45,6 +45,7 @@ struct LockState {
     Array<PendingWrite> pendingWrites; // Buffered writes (applied on commit)
     u64 snapshotSeq = 0;              // MVCC: journal sequence at lock time
     Array<u64> touchedRowIds;         // MVCC: row IDs read/written in this tx
+    bool requiresExplicitAs = true;   // Snapshot protection
 };
 
 class Journal {
@@ -75,7 +76,7 @@ public:
     void appendBatch(const Array<JournalEntry>& entries);
 
     // Transactional API
-    u64  lockBegin();
+    u64  lockBegin(bool requiresExplicitAs = true);
     bool lockPendingWrite(u64 lockId, const PendingWrite& pw);
     bool lockAppend(u64 lockId, JournalOpType op, u16 targetBlock, const String& payload);
     bool lockCommit(u64 lockId);

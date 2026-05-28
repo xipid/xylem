@@ -157,3 +157,19 @@ The CLI provides **native arrow key history navigation**, **inline text editing*
 - `IO <linux_path> <xylem_path>`: Recursively bulk-import an entire Linux directory tree into Xylem. This operates using highly optimized transactional batching (200 ops/lock) for blazingly fast ingestion.
 - `UNLINK <xylem_path>`: Safely and recursively wipe an entire directory and all its descendants from the database.
 - `READ ...`: Execute raw query language statements directly.
+
+## 5. Unique ID Generation
+Xylem provides a built-in cryptographically safe random unique ID generator. To generate a 64-bit ID and guarantee it does not currently exist in a specific column in the database, use:
+
+```cpp
+String newId = xm.generateId("user_id");
+```
+
+### The `:generate` Syntax
+To make ID assignment trivial in queries, Xylem supports a special `:generate` column suffix for `WRITE` operations. Xylem will automatically replace the assignment value with a freshly generated, unique 64-bit ID for that base column:
+
+```
+WRITE user_id:generate=0 name=Alice role=admin
+```
+
+This guarantees `user_id` will be a unique numeric ID for the newly created row.

@@ -22,7 +22,21 @@ assert(hash1 == hash2); // Guaranteed to match
 ### Overloads:
 *   `writeHash(content)`: Automatically hashes content and stores it.
 *   `writeHash(content, hash)`: Write content with a custom-provided hash.
-*   `writeHash(content, position)`: Overload to write the blob directly to a specific physical byte offset (useful for layout layouts or bootloader pinning).
+*   `writeHash(content, position)`: Write the blob to a physical position (legacy usage, see Pointer Blobs).
+
+---
+
+## Pointer Blobs (RAW Mapping & Freezing)
+Xylem allows storing blobs directly mapped to raw physical byte offsets via **Pointer Blobs**. When a blob is "frozen" at a specific address, Xylem writes the raw payload natively to the flash medium without any Xylem-specific chunk headers or linked-list metadata.
+
+```cpp
+// Freeze a blob at physical byte offset 0x1000
+xm.freezeBlob(0x1000, blobRef);
+```
+
+*   **Native Compatibility**: A frozen pointer blob at address `0x1000` appears exactly as its original payload. This makes pointer blobs ideal for OTA bootloader firmware partitions, raw file exports, or direct external flash mapping.
+*   **Automatic Expansion (Vacuuming)**: If a frozen blob expands due to an append operation, Xylem automatically "vacuums" the necessary trailing raw blocks—relocating any interfering standard data structures—to guarantee the pointer blob remains physically contiguous and header-less.
+*   **Safe Thawing**: Deleting a pointer blob natively instructs Xylem to "thaw" the address space, allowing Xylem's wear-leveling allocator to reclaim and reuse the physical area.
 
 ---
 

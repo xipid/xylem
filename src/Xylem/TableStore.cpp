@@ -55,11 +55,17 @@ void TableStore::evictIfNeeded() {
         
         if (allRows.has(evictId)) {
             Map<String, String>& row = *allRows.get(evictId);
-            if (saveToDisk && !volatileRows.has(evictId)) saveToDisk(evictId, &row);
+            if (saveToDisk) {
+                // If the block is dirty, we just mark it dirty. The volatile flag ensures it goes to SWAP.
+                u64 blockId = evictId / 1000;
+                dirtyBlocks.set(blockId, true);
+                // We do NOT call volatileRows.remove(evictId) here because we still need to know it's volatile when flushing!
+                // But we remove from memory.
+                saveToDisk(evictId, &row); // This just calls an external callback if any
+            }
             currentMemoryBytes -= approxRowBytes(row);
             allRows.remove(evictId);
         }
-        volatileRows.remove(evictId);
     }
 }
 
@@ -1556,11 +1562,23 @@ void TableStore::flushAllRows() {
     for (auto it = dirtyBlocks.begin(); it != dirtyBlocks.end(); ++it) {
         if (it->value) {
             u64 blockId = it->key;
+            
+            // Write persistent rows
             String data;
-            serializeBlock(blockId, data);
+            serializeBlock(blockId, data, false);
             if (!data.isEmpty()) {
                 writeBlob("ROW_BLOCK_" + String::from(blockId), data);
             }
+            
+            // Write volatile SWAP rows
+            String volData;
+            serializeBlock(blockId, volData, true);
+            if (!volData.isEmpty()) {
+                writeBlob("VOLATILE_BLOCK_" + String::from(blockId), volData);
+            } else {
+                if (blobStore) blobStore->removeHash("VOLATILE_BLOCK_" + String::from(blockId));
+            }
+            
             it->value = false;
         }
     }
@@ -1568,13 +1586,26 @@ void TableStore::flushAllRows() {
 
 bool TableStore::loadBlock(u64 blockId) {
     if (!readBlob) return false;
+    bool loadedAny = false;
+    
+    // Load persistent block
     String data = readBlob("ROW_BLOCK_" + String::from(blockId));
-    if (data.isEmpty()) return false;
-    deserializeBlock(blockId, data);
-    return true;
+    if (!data.isEmpty()) {
+        deserializeBlock(blockId, data, false);
+        loadedAny = true;
+    }
+    
+    // Load volatile SWAP block
+    String volData = readBlob("VOLATILE_BLOCK_" + String::from(blockId));
+    if (!volData.isEmpty()) {
+        deserializeBlock(blockId, volData, true);
+        loadedAny = true;
+    }
+    
+    return loadedAny;
 }
 
-void TableStore::serializeBlock(u64 blockId, String& out) {
+void TableStore::serializeBlock(u64 blockId, String& out, bool volatileOnly) {
     u64 startId = blockId * 1000;
     u64 endId = startId + 1000;
     
@@ -1584,8 +1615,11 @@ void TableStore::serializeBlock(u64 blockId, String& out) {
         existMap.set(allRowIds[j], true);
     }
     for (u64 rId = startId; rId < endId; ++rId) {
-        if (existMap.has(rId) && !volatileRows.has(rId)) {
-            rowIds.push(rId);
+        if (existMap.has(rId)) {
+            bool isVol = volatileRows.has(rId);
+            if ((volatileOnly && isVol) || (!volatileOnly && !isVol)) {
+                rowIds.push(rId);
+            }
         }
     }
     
@@ -1659,7 +1693,7 @@ void TableStore::serializeBlock(u64 blockId, String& out) {
     out += compressed;
 }
 
-void TableStore::deserializeBlock(u64 blockId, const String& in) {
+void TableStore::deserializeBlock(u64 blockId, const String& in, bool isVolatile) {
     if (in.size() < 4) return;
     const u8* ptr = (const u8*)in.data();
     const u8* end = (const u8*)in.data() + in.size();
@@ -1751,6 +1785,7 @@ void TableStore::deserializeBlock(u64 blockId, const String& in) {
     for (u32 i = 0; i < rowCount; ++i) {
         if (rows[i].size() > 0) {
             allRows.set(rowIds[i], rows[i]);
+            if (isVolatile) volatileRows.set(rowIds[i], true);
             currentMemoryBytes += approxRowBytes(rows[i]);
         }
     }
