@@ -155,6 +155,17 @@ Array<GraphOp> QueryParser::parseExtract(const String& pathStr) {
         ops.push(follow);
     }
 
+    GraphOp repeatFollow;
+    repeatFollow.type = GraphOpType::REPEATFOLLOW;
+    Clause rfId;
+    rfId.col = "parent_id";
+    rfId.op = "=";
+    rfId.val = "parent.id";
+    Clauses rfGroup;
+    rfGroup.push(rfId);
+    repeatFollow.query.push(rfGroup);
+    ops.push(repeatFollow);
+
     return ops;
 }
 

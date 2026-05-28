@@ -59,9 +59,6 @@ RowNode *getDeepestRowNode(TreeItem *item) {
   if (!item)
     return nullptr;
   if (RowNode *rn = dynamic_cast<RowNode *>(item)) {
-    if (rn->size() > 0) {
-      return getDeepestRowNode((*rn)[0]);
-    }
     return rn;
   }
   if (TreeBranch *tb = dynamic_cast<TreeBranch *>(item)) {
@@ -679,6 +676,27 @@ int main(int argc, char **argv) {
       if (res.treeResult)
         delete res.treeResult;
       continue;
+    }
+
+    // Intercept path commands to apply pwd
+    if (cmd == "LS" || cmd == "CAT" || cmd == "UNLINK") {
+      if (tokens.size() > 1) {
+        String targetPath = resolvePath(pwd, tokens[1]);
+        line = cmd + " \"" + targetPath + "\"";
+        for (usz i = 2; i < tokens.size(); ++i) {
+          line += " " + tokens[i];
+        }
+      } else if (cmd == "LS") {
+        line = "LS \"" + pwd + "\"";
+      }
+    } else if (cmd == "TEE") {
+      if (tokens.size() > 2) {
+        String targetPath = resolvePath(pwd, tokens[1]);
+        line = "TEE \"" + targetPath + "\" " + tokens[2];
+        for (usz i = 3; i < tokens.size(); ++i) {
+          line += " " + tokens[i];
+        }
+      }
     }
 
     // Pass any other command directly to the Query Parser
