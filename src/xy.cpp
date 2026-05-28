@@ -624,32 +624,55 @@ int main(int argc, char **argv) {
       String q = "GR EXTRACT \"" + xylemPath + "\"";
       QueryResult res = xm.query(q);
       if (res.treeResult && res.treeResult->size() > 0) {
-        RowNode *rn = getDeepestRowNode((*res.treeResult)[0]);
-        String content;
-        bool foundContent = false;
-        if (rn) {
-          if (rn->row.has("content")) {
-            content = *rn->row.get("content");
-            foundContent = true;
-          } else if (rn->row.has("content:blob")) {
-            content = xm.getBlob(rn->row.get("content:blob")->toInt());
-            foundContent = true;
-          }
-        }
-
-        if (foundContent) {
-          std::ofstream file((const char *)linuxPath.data(), std::ios::binary);
-          if (file.is_open()) {
-            file.write((const char *)content.data(), content.size());
-            printf("OI: Wrote %llu bytes to %s\n",
-                   (unsigned long long)content.size(), linuxPath.data());
-          } else {
-            printf("Error: Could not write to Linux file %s\n",
-                   linuxPath.data());
-          }
-        } else {
-          printf("Error: Node has no 'content' column.\n");
-        }
+        struct ExtractContext {
+            XylemEngine* xm;
+            void (*extract)(ExtractContext*, const TreeItem*, const String&);
+        };
+        ExtractContext ctx;
+        ctx.xm = &xm;
+        ctx.extract = [](ExtractContext* c, const TreeItem* node, const String& lPath) {
+            if (!node) return;
+            const RowNode* rn = getDeepestRowNode(const_cast<TreeItem*>(node));
+            if (!rn) return;
+            
+            String type = "";
+            if (rn->row.has("type")) type = *rn->row.get("type");
+            
+            if (type == "dir") {
+                std::filesystem::create_directories((const char*)lPath.data());
+                for (usz i = 0; i < rn->size(); ++i) {
+                    if ((*rn)[i]) {
+                        const RowNode* child = getDeepestRowNode((*rn)[i]);
+                        if (child && child->row.has("name")) {
+                            String childName = *child->row.get("name");
+                            c->extract(c, (*rn)[i], lPath + "/" + childName);
+                        }
+                    }
+                }
+            } else {
+                String content;
+                bool foundContent = false;
+                if (rn->row.has("content")) {
+                    content = *rn->row.get("content");
+                    foundContent = true;
+                } else if (rn->row.has("content:blob")) {
+                    content = c->xm->getBlob(rn->row.get("content:blob")->toInt());
+                    foundContent = true;
+                }
+                if (foundContent) {
+                    std::ofstream file((const char*)lPath.data(), std::ios::binary);
+                    if (file.is_open()) {
+                        file.write((const char*)content.data(), content.size());
+                        printf("OI: Wrote %llu bytes to %s\n", (unsigned long long)content.size(), lPath.data());
+                    } else {
+                        printf("Error: Could not write to Linux file %s\n", lPath.data());
+                    }
+                } else {
+                    printf("Error: Node has no 'content' column.\n");
+                }
+            }
+        };
+        ctx.extract(&ctx, (*res.treeResult)[0], linuxPath);
       } else {
         printf("Error: Xylem path not found.\n");
       }
@@ -665,9 +688,26 @@ int main(int argc, char **argv) {
         cmd == "TEE" || cmd == "UNLINK") {
       // xm.flush() is now done internally instantly by XylemEngine.
     }
+    
+    if (cmd == "VACUUM" || cmd == "VACCUM" || cmd == "DESTROY") {
+      u64 unused = xm.getUnusedBlockSpace();
+      u64 newSize = xm.config.deviceSize - unused;
+      if (newSize > 0) {
+        truncate((const char*)dbPath.data(), newSize);
+        printf("xy: File truncated to %llu bytes\n", (unsigned long long)newSize);
+      }
+    }
   }
 
+  xm.vaccum();
+  u64 unused = xm.getUnusedBlockSpace();
+  u64 newSize = xm.config.deviceSize - unused;
   xm.destroy();
+  if (newSize > 0 && newSize < xm.config.deviceSize) {
+    truncate((const char*)dbPath.data(), newSize);
+    printf("Vacuumed on exit. File size reduced to %llu bytes.\n", (unsigned long long)newSize);
+  }
+  
   printf("Goodbye.\n");
   return 0;
 }

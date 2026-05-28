@@ -1115,6 +1115,20 @@ void XylemEngine::thawBlob(u32 blobRef) {
 
 // ─── Vacuum / Freeze / Thaw ───────────────────────────────────────────────────
 
+u64 XylemEngine::getUnusedBlockSpace() {
+    if (!allocator || !device) return 0;
+    u32 totalBlocks = allocator->bam.size();
+    u32 emptyCount = 0;
+    for (usz i = totalBlocks; i > 0; --i) {
+        if (allocator->bam[i - 1].getStatus() == BlockStatus::FREE) {
+            emptyCount++;
+        } else {
+            break;
+        }
+    }
+    return (u64)emptyCount * config.blockSize;
+}
+
 void XylemEngine::vaccum() {
     ensureMounted();
     if (!allocator || !device) return;

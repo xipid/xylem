@@ -1548,6 +1548,22 @@ int TableStore::graphWrite(const Array<GraphOp>& ops, const String& encryptionKe
                 updateLru(id);
             }
             evictIfNeeded();
+        } else if (op.type == GraphOpType::REMOVE) {
+            for (u64 id : activeIds) {
+                if (isVolatile) {
+                    if (volatileRows.has(id)) {
+                        volatileRows.remove(id);
+                        allRows.remove(id);
+                        rowModSeq.set(id, currentSeq + 1);
+                    }
+                } else {
+                    currentSeq++;
+                    Map<String, String> dummy;
+                    dummy.set("___tombstone", "1");
+                    allRows.set(id, dummy);
+                    rowModSeq.set(id, currentSeq);
+                }
+            }
         }
     }
     return 0;

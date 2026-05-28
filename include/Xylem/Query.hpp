@@ -162,7 +162,8 @@ enum class GraphOpType {
     FOLLOW,
     REPEATFOLLOW,
     UNTIL,
-    SET
+    SET,
+    REMOVE
 };
 
 struct GraphOp {

@@ -96,6 +96,8 @@ public:
     void vaccum();                                  // Shrink from end
     bool vaccum(u64 startPos);                      // Vaccum from startPos to end
     bool vaccum(u64 startPos, u64 endPos);           // Vaccum region
+    
+    u64 getUnusedBlockSpace();                       // Count unused space from the end of the device
 
     bool freeze(u64 startPos, u64 endPos);           // Prevent Xylem from writing here
     bool thaw(u64 startPos, u64 endPos);             // Allow Xylem to write here again

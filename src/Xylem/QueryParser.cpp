@@ -322,16 +322,39 @@ QueryResult QueryParser::execute(XylemEngine* engine, const String& queryStr, co
                     for(usz i=0; i<extOps.size(); ++i) ops.push(extOps[i]);
                     idx++;
                 }
-            } else if (tu == "SET" && isWrite) {
+            } else if (tu == "MATCH" || tu == "FOLLOW" || tu == "REPEATFOLLOW" || tu == "UNTIL" || (tu == "SET" && isWrite)) {
+                GraphOp op;
+                if (tu == "MATCH") op.type = GraphOpType::MATCH;
+                else if (tu == "FOLLOW") op.type = GraphOpType::FOLLOW;
+                else if (tu == "REPEATFOLLOW") op.type = GraphOpType::REPEATFOLLOW;
+                else if (tu == "UNTIL") op.type = GraphOpType::UNTIL;
+                else if (tu == "SET") op.type = GraphOpType::SET;
+                
                 idx++;
-                GraphOp setOp;
-                setOp.type = GraphOpType::SET;
+                Clauses group;
                 while (idx < tokens.size()) {
-                    setOp.writeSet.push(parseClauseStr(tokens[idx]));
+                    String t2 = tokens[idx].toUpperCase();
+                    if (t2 == "MATCH" || t2 == "FOLLOW" || t2 == "REPEATFOLLOW" || t2 == "UNTIL" || t2 == "SET" || t2 == "REMOVE" || t2 == "EXTRACT") {
+                        break;
+                    }
+                    if (t2 == "OR") {
+                        if (group.size() > 0) { op.query.push(group); group.clear(); }
+                        idx++; continue;
+                    }
+                    if (op.type == GraphOpType::SET) {
+                        op.writeSet.push(parseClauseStr(tokens[idx]));
+                    } else {
+                        group.push(parseClauseStr(tokens[idx]));
+                    }
                     idx++;
                 }
-                ops.push(setOp);
-                break;
+                if (group.size() > 0) op.query.push(group);
+                ops.push(op);
+            } else if (tu == "REMOVE" && isWrite) {
+                GraphOp op;
+                op.type = GraphOpType::REMOVE;
+                ops.push(op);
+                idx++;
             } else if (!isWrite) {
                 // columns for read
                 columns.push(t);
@@ -362,6 +385,141 @@ QueryResult QueryParser::execute(XylemEngine* engine, const String& queryStr, co
             res.treeResult = engine->graphRead(columns, ops, 0, 0);
             res.code = (res.treeResult != nullptr) ? 0 : -1;
         }
+        return res;
+    }
+
+    if (cmd == "FREEZE" || cmd == "THAW") {
+        Array<Clauses> queryClauses;
+        Clauses currentGroup;
+        bool inWhere = false;
+        u64 freezePos = 0;
+        usz idx = 1;
+        
+        if (cmd == "FREEZE") {
+            if (idx < tokens.size()) {
+                freezePos = (u64)strtoull((const char*)tokens[idx].data(), nullptr, 0);
+                idx++;
+            }
+        }
+        
+        while (idx < tokens.size()) {
+            String t = tokens[idx];
+            String tu = t.toUpperCase();
+            if (tu == "WHERE") {
+                inWhere = true;
+                idx++;
+                if (idx < tokens.size()) {
+                    currentGroup.push(parseClauseStr(tokens[idx]));
+                }
+            } else if (tu == "OR") {
+                if (idx + 1 < tokens.size() && tokens[idx+1].toUpperCase() == "WHERE") {
+                    if (currentGroup.size() > 0) {
+                        queryClauses.push(currentGroup);
+                        currentGroup.clear();
+                    }
+                    inWhere = true;
+                    idx += 2;
+                    if (idx < tokens.size()) {
+                        currentGroup.push(parseClauseStr(tokens[idx]));
+                    }
+                }
+            } else {
+                if (inWhere) currentGroup.push(parseClauseStr(t));
+            }
+            idx++;
+        }
+        if (currentGroup.size() > 0) queryClauses.push(currentGroup);
+        
+        Array<String> readCols;
+        readCols.push("id");
+        readCols.push("content:blob");
+        Array<Map<String, String>> rows = engine->read(readCols, queryClauses);
+        u64 affected = 0;
+        for (const auto& row : rows) {
+            if (row.has("content:blob")) {
+                u32 ref = (u32)row.get("content:blob")->toInt();
+                if (cmd == "FREEZE") {
+                    if (engine->freezeBlob(freezePos, ref)) affected++;
+                } else {
+                    engine->thawBlob(ref);
+                    affected++;
+                }
+            }
+        }
+        res.code = affected;
+        return res;
+    }
+
+    if (cmd == "VACUUM" || cmd == "VACCUM") {
+        if (tokens.size() == 1) { engine->vaccum(); res.code = 0; }
+        else if (tokens.size() == 2) { engine->vaccum(strtoull((const char*)tokens[1].data(), nullptr, 0)); res.code = 0; }
+        else if (tokens.size() == 3) { engine->vaccum(strtoull((const char*)tokens[1].data(), nullptr, 0), strtoull((const char*)tokens[2].data(), nullptr, 0)); res.code = 0; }
+        return res;
+    }
+
+    if (cmd == "LOCK") {
+        bool req = false;
+        if (tokens.size() > 2 && tokens[1].toUpperCase() == "AS") {
+            req = tokens[2] == "1" || tokens[2].toUpperCase() == "TRUE";
+        }
+        res.code = engine->lock(Array<Clauses>(), 0, req);
+        return res;
+    }
+
+    if (cmd == "UNLOCK") {
+        if (tokens.size() > 1) res.code = engine->unlock(strtoull((const char*)tokens[1].data(), nullptr, 0));
+        return res;
+    }
+
+    if (cmd == "ROLLBACK") {
+        if (tokens.size() > 1) res.code = engine->rollback(strtoull((const char*)tokens[1].data(), nullptr, 0)) ? 0 : -1;
+        return res;
+    }
+
+    if (cmd == "UNWATCH") {
+        if (tokens.size() > 1) res.code = engine->unwatch(strtoull((const char*)tokens[1].data(), nullptr, 0)) ? 0 : -1;
+        return res;
+    }
+
+    if (cmd == "PULL") {
+        if (tokens.size() > 1) {
+            u64 watchId = strtoull((const char*)tokens[1].data(), nullptr, 0);
+            res.readRows = engine->pull(watchId);
+            res.code = 0;
+        } else {
+            res.code = -1;
+        }
+        return res;
+    }
+
+    if (cmd == "WATCH") {
+        Array<Clauses> queryClauses;
+        Clauses currentGroup;
+        bool inWhere = false;
+        usz idx = 1;
+        
+        while (idx < tokens.size()) {
+            String t = tokens[idx];
+            String tu = t.toUpperCase();
+            if (tu == "WHERE") {
+                inWhere = true;
+                idx++;
+                if (idx < tokens.size()) currentGroup.push(parseClauseStr(tokens[idx]));
+            } else if (tu == "OR") {
+                if (idx + 1 < tokens.size() && tokens[idx+1].toUpperCase() == "WHERE") {
+                    if (currentGroup.size() > 0) { queryClauses.push(currentGroup); currentGroup.clear(); }
+                    inWhere = true;
+                    idx += 2;
+                    if (idx < tokens.size()) currentGroup.push(parseClauseStr(tokens[idx]));
+                }
+            } else {
+                if (inWhere) currentGroup.push(parseClauseStr(t));
+            }
+            idx++;
+        }
+        if (currentGroup.size() > 0) queryClauses.push(currentGroup);
+        
+        res.code = engine->watch(queryClauses);
         return res;
     }
 
