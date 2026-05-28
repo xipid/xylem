@@ -97,7 +97,21 @@ Array<GraphOp> QueryParser::parseExtract(const String& pathStr) {
         if (!parts[i].isEmpty()) cleanParts.push(parts[i]);
     }
 
-    if (cleanParts.size() == 0) return ops;
+    if (cleanParts.size() == 0) {
+        // Root MATCH
+        GraphOp match;
+        match.type = GraphOpType::MATCH;
+        Clause rootParent;
+        rootParent.col = "parent_id";
+        rootParent.op = "=";
+        rootParent.val = "0";
+
+        Clauses group;
+        group.push(rootParent);
+        match.query.push(group);
+        ops.push(match);
+        return ops;
+    }
 
     // Root MATCH
     GraphOp match;
