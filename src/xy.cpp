@@ -432,8 +432,9 @@ int main(int argc, char **argv) {
 
       Map<String, String> dirCache;
       dirCache.set("0", "0");
+      Array<String> newDirs;
 
-      u64 txId = xm.lock();
+      u64 txId = xm.lock(Array<Clauses>(), 0, false);
       int txCount = 0;
 
       auto uploadFile = [&](const String &srcPath, const String &dstPath) {
@@ -479,16 +480,35 @@ int main(int argc, char **argv) {
               } else {
                 u64 rnd = ((u64)Xi::randomNext() << 32) | Xi::randomNext();
                 String newId(rnd);
-                String wq =
-                    "WRITE name=%1 parent_id=%2 id=%3 type=dir perms=755";
-                Array<String> wa;
-                wa.push(partName);
-                wa.push(currentParentId);
-                wa.push(newId);
-                xm.query(
-                    wq,
-                    wa); // Dirs are outside the batch tx for safety with READ
+                Array<Clause> writeCols;
+                Clause c1;
+                c1.col = "name";
+                c1.op = "=";
+                c1.val = partName;
+                Clause c2;
+                c2.col = "parent_id";
+                c2.op = "=";
+                c2.val = currentParentId;
+                Clause c3;
+                c3.col = "id";
+                c3.op = "=";
+                c3.val = newId;
+                Clause c4;
+                c4.col = "type";
+                c4.op = "=";
+                c4.val = "dir";
+                Clause c5;
+                c5.col = "perms";
+                c5.op = "=";
+                c5.val = "755";
+                writeCols.push(c1);
+                writeCols.push(c2);
+                writeCols.push(c3);
+                writeCols.push(c4);
+                writeCols.push(c5);
+                xm.write(writeCols, Array<Clauses>(), txId);
                 currentParentId = newId;
+                newDirs.push(currentPathStr);
               }
               dirCache.set(currentPathStr, currentParentId);
             }
@@ -568,14 +588,12 @@ int main(int argc, char **argv) {
           }
 
           txCount++;
-          if (txCount >= 200) {
+          if (txCount >= 500) {
             xm.unlock(txId);
-            txId = xm.lock();
+            txId = xm.lock(Array<Clauses>(), 0, false);
             txCount = 0;
+            printf("IO: Synced %s to disk...\n", dstPath.data());
           }
-
-          printf("IO: Wrote %llu bytes to %s\n", (unsigned long long)size,
-                 dstPath.data());
         } else {
           printf("Error: Failed to read file %s\n", srcPath.data());
         }
@@ -622,52 +640,58 @@ int main(int argc, char **argv) {
       QueryResult res = xm.query(q);
       if (res.treeResult && res.treeResult->size() > 0) {
         struct ExtractContext {
-            XylemEngine* xm;
-            void (*extract)(ExtractContext*, const TreeItem*, const String&);
+          XylemEngine *xm;
+          void (*extract)(ExtractContext *, const TreeItem *, const String &);
         };
         ExtractContext ctx;
         ctx.xm = &xm;
-        ctx.extract = [](ExtractContext* c, const TreeItem* node, const String& lPath) {
-            if (!node) return;
-            const RowNode* rn = getDeepestRowNode(const_cast<TreeItem*>(node));
-            if (!rn) return;
-            
-            String type = "";
-            if (rn->row.has("type")) type = *rn->row.get("type");
-            
-            if (type == "dir") {
-                std::filesystem::create_directories((const char*)lPath.data());
-                for (usz i = 0; i < rn->size(); ++i) {
-                    if ((*rn)[i]) {
-                        const RowNode* child = getDeepestRowNode((*rn)[i]);
-                        if (child && child->row.has("name")) {
-                            String childName = *child->row.get("name");
-                            c->extract(c, (*rn)[i], lPath + "/" + childName);
-                        }
-                    }
+        ctx.extract = [](ExtractContext *c, const TreeItem *node,
+                         const String &lPath) {
+          if (!node)
+            return;
+          const RowNode *rn = getDeepestRowNode(const_cast<TreeItem *>(node));
+          if (!rn)
+            return;
+
+          String type = "";
+          if (rn->row.has("type"))
+            type = *rn->row.get("type");
+
+          if (type == "dir") {
+            std::filesystem::create_directories((const char *)lPath.data());
+            for (usz i = 0; i < rn->size(); ++i) {
+              if ((*rn)[i]) {
+                const RowNode *child = getDeepestRowNode((*rn)[i]);
+                if (child && child->row.has("name")) {
+                  String childName = *child->row.get("name");
+                  c->extract(c, (*rn)[i], lPath + "/" + childName);
                 }
-            } else {
-                String content;
-                bool foundContent = false;
-                if (rn->row.has("content")) {
-                    content = *rn->row.get("content");
-                    foundContent = true;
-                } else if (rn->row.has("content:blob")) {
-                    content = c->xm->getBlob(rn->row.get("content:blob")->toInt());
-                    foundContent = true;
-                }
-                if (foundContent) {
-                    std::ofstream file((const char*)lPath.data(), std::ios::binary);
-                    if (file.is_open()) {
-                        file.write((const char*)content.data(), content.size());
-                        printf("OI: Wrote %llu bytes to %s\n", (unsigned long long)content.size(), lPath.data());
-                    } else {
-                        printf("Error: Could not write to Linux file %s\n", lPath.data());
-                    }
-                } else {
-                    printf("Error: Node has no 'content' column.\n");
-                }
+              }
             }
+          } else {
+            String content;
+            bool foundContent = false;
+            if (rn->row.has("content")) {
+              content = *rn->row.get("content");
+              foundContent = true;
+            } else if (rn->row.has("content:blob")) {
+              content = c->xm->getBlob(rn->row.get("content:blob")->toInt());
+              foundContent = true;
+            }
+            if (foundContent) {
+              std::ofstream file((const char *)lPath.data(), std::ios::binary);
+              if (file.is_open()) {
+                file.write((const char *)content.data(), content.size());
+                printf("OI: Wrote %llu bytes to %s\n",
+                       (unsigned long long)content.size(), lPath.data());
+              } else {
+                printf("Error: Could not write to Linux file %s\n",
+                       lPath.data());
+              }
+            } else {
+              printf("Error: Node has no 'content' column.\n");
+            }
+          }
         };
         ctx.extract(&ctx, (*res.treeResult)[0], linuxPath);
       } else {
@@ -706,13 +730,14 @@ int main(int argc, char **argv) {
         cmd == "TEE" || cmd == "UNLINK") {
       // xm.flush() is now done internally instantly by XylemEngine.
     }
-    
+
     if (cmd == "VACUUM" || cmd == "VACCUM" || cmd == "DESTROY") {
       u64 unused = xm.getUnusedBlockSpace();
       u64 newSize = xm.config.deviceSize - unused;
       if (newSize > 0) {
-        truncate((const char*)dbPath.data(), newSize);
-        printf("xy: File truncated to %llu bytes\n", (unsigned long long)newSize);
+        truncate((const char *)dbPath.data(), newSize);
+        printf("xy: File truncated to %llu bytes\n",
+               (unsigned long long)newSize);
       }
     }
   }
@@ -720,12 +745,13 @@ int main(int argc, char **argv) {
   xm.vaccum();
   u64 unused = xm.getUnusedBlockSpace();
   u64 newSize = xm.config.deviceSize - unused;
-  xm.destroy();
+  xm.vaccum();
   if (newSize > 0 && newSize < xm.config.deviceSize) {
-    truncate((const char*)dbPath.data(), newSize);
-    printf("Vacuumed on exit. File size reduced to %llu bytes.\n", (unsigned long long)newSize);
+    truncate((const char *)dbPath.data(), newSize);
+    printf("Vacuumed on exit. File size reduced to %llu bytes.\n",
+           (unsigned long long)newSize);
   }
-  
+
   printf("Goodbye.\n");
   return 0;
 }

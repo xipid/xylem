@@ -107,6 +107,7 @@ Xylem allows you to subscribe to database mutations in real-time. This is fully 
 ## 6. Utilities & Filesystem
 
 The `xy` CLI adds filesystem macro commands that execute under the hood:
+*   `CD <path>`: Change the current working directory in the `xy` shell for all subsequent filesystem operations.
 *   `CAT <path>`: Read file content from the Xylem VFS.
 *   `TEE <path> <content>`: Write a file to the Xylem VFS.
 *   `IO <linux_path> <xylem_path>`: Ingest a Linux folder into Xylem.

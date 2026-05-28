@@ -798,6 +798,10 @@ int XylemEngine::write(const Array<Clause>& columns, const Array<Clauses>& claus
         pw.clauses       = clauses;
         pw.encryptionKey = encryptionKey;
         journal->lockPendingWrite(txId, pw);
+        
+        String payload = Journal::serializeTableWrite(columns, clauses, encryptionKey);
+        journal->lockAppend(txId, JournalOpType::TABLE_WRITE, 0, payload);
+        
         return 0;
     }
 
@@ -855,7 +859,12 @@ int XylemEngine::graphWrite(const Array<GraphOp>& ops, u64 txId, const String& e
     if (isWriteBlocked(txId)) return -1;
     if (txId != 0) {
         if (!tableStore) return -1;
-        return tableStore->graphWrite(ops, encryptionKey, txId);
+        int r = tableStore->graphWrite(ops, encryptionKey, txId);
+        if (r == 0) {
+            String payload = Journal::serializeGraphWrite(ops, encryptionKey);
+            journal->lockAppend(txId, JournalOpType::ROW_WRITE, 0, payload);
+        }
+        return r;
     }
     int r = tableStore ? tableStore->graphWrite(ops, encryptionKey) : -1;
     if (r == 0) {
@@ -880,8 +889,12 @@ bool XylemEngine::remove(const Array<Clauses>& clauses, u64 length, u64 as) {
     bool ok = tableStore->remove(clauses, length);
     if (ok) {
         String payload = Journal::serializeTableRemove(clauses, length);
-        journal->append(JournalOpType::TABLE_REMOVE, 0, payload);
-        if (payload.size() > 4000 || journal->isNearingCapacity()) flush();
+        if (as != 0) {
+            journal->lockAppend(as, JournalOpType::TABLE_REMOVE, 0, payload);
+        } else {
+            journal->append(JournalOpType::TABLE_REMOVE, 0, payload);
+            if (payload.size() > 4000 || journal->isNearingCapacity()) flush();
+        }
     }
     return ok;
 }

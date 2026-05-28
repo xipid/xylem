@@ -70,7 +70,17 @@ Xylem provides a built-in shell for rapid prototyping.
 > VACUUM
 ```
 
-### 2. Simple C++ Row CRUD
+### 2. Using Xylem as a Virtual File System
+Xylem provides native macro commands to ingest, navigate, and export folders directly to/from your Linux filesystem.
+```bash
+> IO /home/user/project my_project
+> CD my_project
+> LS
+> OI . /tmp/exported_project
+> VACUUM
+```
+
+### 3. Simple C++ Row CRUD
 ```cpp
 #include <Xylem/Xylem.hpp>
 
