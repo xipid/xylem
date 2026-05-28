@@ -10,7 +10,7 @@ XylemEngine::XylemEngine() {
 }
 
 XylemEngine::~XylemEngine() {
-    unmount();
+    destroy();
 }
 
 u32 getTriangularBlock(u32 i, u32 totalBlocks) {
@@ -238,14 +238,14 @@ bool XylemEngine::mount() {
 
     journal = new Journal(device, allocator);
     journal->initFromFormat((u16)jnlStart, (u16)jnlCount, maxSeq);
-    journal->recover();
 
     tableStore = new TableStore(device, allocator, &globalKeys);
     tableStore->maxMemoryBytes = maxCache > 0 ? maxCache / 2 : 4 * 1024 * 1024;
 
     blobStore = new BlobStore(device, allocator, &globalKeys);
     blobStore->scanFromDevice();
-
+    blobStore->loadRefsAndUsage();
+    blobStore->loadPendingFreezes();
     // Wire up BlobStore pointer in TableStore
     tableStore->blobStore = blobStore;
 
@@ -369,16 +369,39 @@ bool XylemEngine::mount() {
     };
 
     tableStore->loadSchemas();
+    journal->recover(tableStore);
+
     cache   = new Cache(device, maxCache);
     watcher = new Watcher(tableStore);
 
     return true;
 }
 
-// ─── unmount() / flush() ─────────────────────────────────────────────────────
+// ─── destroy() / flush() ─────────────────────────────────────────────────────────
 
-void XylemEngine::unmount() {
+void XylemEngine::destroy() {
+    // Save everything corruption-free
     flush();
+
+    // Remove volatile items from memory
+    if (tableStore) {
+        Array<u64> toRemove;
+        for (auto it = tableStore->volatileRows.begin(); it != tableStore->volatileRows.end(); ++it) {
+            toRemove.push(it->key);
+        }
+        for (usz i = 0; i < toRemove.size(); ++i) {
+            tableStore->allRows.remove(toRemove[i]);
+            // Remove from allRowIds
+            Array<u64> newIds;
+            for (usz j = 0; j < tableStore->allRowIds.size(); ++j) {
+                if (tableStore->allRowIds[j] != toRemove[i]) newIds.push(tableStore->allRowIds[j]);
+            }
+            tableStore->allRowIds = newIds;
+        }
+        tableStore->volatileRows.clear();
+    }
+
+    // Free all resources
     delete watcher;
     delete cache;
     delete blobStore;
@@ -396,12 +419,22 @@ void XylemEngine::unmount() {
     device     = nullptr;
 }
 
+bool XylemEngine::isMounted() const {
+    return device != nullptr && allocator != nullptr && tableStore != nullptr;
+}
+
+void XylemEngine::ensureMounted() {
+    if (!isMounted()) mount();
+}
+
 void XylemEngine::flush() {
     if (tableStore) {
         tableStore->flushAllRows();   
         tableStore->flushHnsw();      
         if (blobStore) {
             blobStore->trainDictionary();
+            blobStore->saveRefsAndUsage();
+            blobStore->savePendingFreezes();
         }
         tableStore->saveSchemas();    
     }
@@ -680,6 +713,7 @@ bool XylemEngine::fixRaw(u64 byteAddress, const String& rawData) {
 // ─── Query Parser ────────────────────────────────────────────────────────────
 
 QueryResult XylemEngine::query(const String& queryString, const Array<String>& sanitized) {
+    ensureMounted();
     return QueryParser::execute(this, queryString, sanitized);
 }
 
@@ -687,6 +721,7 @@ QueryResult XylemEngine::query(const String& queryString, const Array<String>& s
 
 Array<Map<String,String>> XylemEngine::read(const Array<String>& columns, const Array<Clauses>& clauses,
                                              u64 length, bool tombstones, u64 txId) {
+    ensureMounted();
     if (!tableStore) return {};
     u64 snapshotSeq = 0;
     if (txId != 0 && journal) {
@@ -697,6 +732,7 @@ Array<Map<String,String>> XylemEngine::read(const Array<String>& columns, const 
 }
 
 int XylemEngine::write(const Array<Clause>& columns, const Array<Clauses>& clauses, u64 txId, const String& encryptionKey) {
+    ensureMounted();
     if (txId != 0) {
         if (!journal) return -1;
         auto* ls = journal->activeLocks.get(txId);
@@ -721,18 +757,25 @@ int XylemEngine::write(const Array<Clause>& columns, const Array<Clauses>& claus
 
     if (!tableStore) return -1;
     int result = tableStore->write(columns, clauses, encryptionKey);
-    if (result == 0 && watcher) {
-        Map<String, String> mockRow;
-        for (const auto& col : columns) {
-            ParsedCol pc = parseCol(col.col);
-            mockRow.set(pc.name, col.val);
+    if (result == 0) {
+        if (watcher) {
+            Map<String, String> mockRow;
+            for (const auto& col : columns) {
+                ParsedCol pc = parseCol(col.col);
+                mockRow.set(pc.name, col.val);
+            }
+            watcher->notify(mockRow);
         }
-        watcher->notify(mockRow);
+        
+        String payload = Journal::serializeTableWrite(columns, clauses, encryptionKey);
+        journal->append(JournalOpType::TABLE_WRITE, 0, payload);
+        if (payload.size() > 4000 || journal->isNearingCapacity()) flush();
     }
     return result;
 }
 
 int XylemEngine::writeVolatile(const Array<Clause>& columns, const Array<Clauses>& clauses, const String& encryptionKey) {
+    ensureMounted();
     if (!tableStore) return -1;
     // Bypass journal entirely (txId = 0) and flag as volatile
     int result = tableStore->write(columns, clauses, encryptionKey, 0, true);
@@ -744,11 +787,13 @@ int XylemEngine::writeVolatile(const Array<Clause>& columns, const Array<Clauses
         }
         watcher->notify(mockRow);
     }
+    flush();
     return result;
 }
 
 Collection::TreeBranch* XylemEngine::graphRead(const Array<String>& columns, const Array<GraphOp>& ops,
                                                 u64 limit, u64 txId) {
+    ensureMounted();
     if (!tableStore) return nullptr;
     u64 snapshotSeq = 0;
     if (txId != 0 && journal) {
@@ -759,26 +804,42 @@ Collection::TreeBranch* XylemEngine::graphRead(const Array<String>& columns, con
 }
 
 int XylemEngine::graphWrite(const Array<GraphOp>& ops, u64 txId, const String& encryptionKey) {
+    ensureMounted();
     if (txId != 0) {
         if (!tableStore) return -1;
         return tableStore->graphWrite(ops, encryptionKey, txId);
     }
-    return tableStore ? tableStore->graphWrite(ops, encryptionKey) : -1;
+    int r = tableStore ? tableStore->graphWrite(ops, encryptionKey) : -1;
+    if (r == 0) {
+        String payload = Journal::serializeGraphWrite(ops, encryptionKey);
+        journal->append(JournalOpType::ROW_WRITE, 0, payload); // Using ROW_WRITE enum to represent GRAPH_WRITE
+        if (payload.size() > 4000 || journal->isNearingCapacity()) flush();
+    }
+    return r;
 }
 
 int XylemEngine::graphWriteVolatile(const Array<GraphOp>& ops, const String& encryptionKey) {
-    if (!tableStore) return -1;
-    return tableStore->graphWrite(ops, encryptionKey, 0, true);
+    ensureMounted();
+    int r = tableStore->graphWrite(ops, encryptionKey, 0, true);
+    // Volatile writes don't get logged to Journal or flushed immediately
+    return r;
 }
 
 bool XylemEngine::remove(const Array<Clauses>& clauses, u64 length, u64 /*as*/) {
-    if (!tableStore) return false;
-    return tableStore->remove(clauses, length);
+    ensureMounted();
+    bool ok = tableStore->remove(clauses, length);
+    if (ok) {
+        String payload = Journal::serializeTableRemove(clauses, length);
+        journal->append(JournalOpType::TABLE_REMOVE, 0, payload);
+        if (payload.size() > 4000 || journal->isNearingCapacity()) flush();
+    }
+    return ok;
 }
 
 // ─── Transactions (MVCC) ─────────────────────────────────────────────────────
 
 u64 XylemEngine::lock(const Array<Clauses>& clauses, u64 /*id*/) {
+    ensureMounted();
     if (!journal) return 0;
     u64 txId = journal->lockBegin();
     if (tableStore) {
@@ -833,6 +894,7 @@ int XylemEngine::unlock(u64 id) {
         u64 oldest = journal->oldestActiveSnapshot();
         tableStore->gcVersions(oldest);
     }
+    flush();
 
     return 0;
 }
@@ -871,9 +933,7 @@ int XylemEngine::fixHash(const String& hash, u64 position) {
     return fixRaw(position, data) ? 0 : -1;
 }
 
-String XylemEngine::statHash(const String& hash) {
-    return blobStore ? blobStore->statHash(hash) : String();
-}
+
 
 String XylemEngine::readHash(const String& hash, u64 min, u64 max) {
     return blobStore ? blobStore->readHash(hash, min, max) : String();
@@ -883,13 +943,391 @@ bool XylemEngine::removeHash(const String& hash) {
     return blobStore ? blobStore->removeHash(hash) : false;
 }
 
+// ─── Blob ref API ─────────────────────────────────────────────────────────────
+
+u32 XylemEngine::getBlobRef(const String& hash) {
+    ensureMounted();
+    return blobStore ? blobStore->getBlobRef(hash) : 0;
+}
+
+String XylemEngine::getBlob(u32 ref) {
+    ensureMounted();
+    return blobStore ? blobStore->getBlob(ref) : String();
+}
+
+u32 XylemEngine::getBlobSize(u32 ref) {
+    ensureMounted();
+    return blobStore ? blobStore->getBlobSize(ref) : 0;
+}
+
+void XylemEngine::writeBlob(u32 ref, const String& content, u64 start) {
+    ensureMounted();
+    if (blobStore) blobStore->writeBlob(ref, content, start);
+}
+
+String XylemEngine::readBlob(u32 ref, u64 start, u64 end) {
+    ensureMounted();
+    return blobStore ? blobStore->readBlob(ref, start, end) : String();
+}
+
+void XylemEngine::setBlob(u32 ref, const String& hash) {
+    ensureMounted();
+    if (blobStore) blobStore->setBlob(ref, hash);
+}
+
+String XylemEngine::setBlob(u32 ref) {
+    ensureMounted();
+    return blobStore ? blobStore->setBlob(ref) : String();
+}
+
+bool XylemEngine::freezeBlob(u64 position, u32 blobRef) {
+    ensureMounted();
+    return blobStore ? blobStore->freezeBlob(position, blobRef) : false;
+}
+
+void XylemEngine::thawBlob(u32 blobRef) {
+    ensureMounted();
+    if (blobStore) blobStore->thawBlob(blobRef);
+}
+
+// ─── Vacuum / Freeze / Thaw ───────────────────────────────────────────────────
+
+void XylemEngine::vaccum() {
+    ensureMounted();
+    if (!allocator || !device) return;
+    u32 totalBlocks = allocator->bam.size();
+    // Shrink from the end: find last used block, free everything after
+    u32 lastUsed = 0;
+    for (u32 i = 0; i < totalBlocks; ++i) {
+        if (allocator->bam[i].getStatus() == BlockStatus::USED ||
+            allocator->bam[i].getStatus() == BlockStatus::RESERVED) {
+            lastUsed = i;
+        }
+    }
+    for (u32 i = lastUsed + 1; i < totalBlocks; ++i) {
+        if (allocator->bam[i].getStatus() == BlockStatus::FREE) {
+            // Already free, nothing to do
+        } else if (allocator->bam[i].getStatus() != BlockStatus::RESERVED) {
+            allocator->freeBlock(i);
+        }
+    }
+    // Run GC
+    if (journal && tableStore) {
+        u64 oldest = journal->oldestActiveSnapshot();
+        tableStore->gcVersions(oldest);
+    }
+    allocator->saveBam();
+}
+
+bool XylemEngine::vaccum(u64 startPos) {
+    ensureMounted();
+    if (!allocator || !device) return false;
+    u32 blockSize = device->config.blockSize;
+    u32 totalBlocks = allocator->bam.size();
+    u32 startBlock = (u32)(startPos / blockSize);
+    return vaccum(startPos, (u64)totalBlocks * blockSize);
+}
+
+bool XylemEngine::vaccum(u64 startPos, u64 endPos) {
+    ensureMounted();
+    if (!allocator || !device) return false;
+    u32 blockSize = device->config.blockSize;
+    u32 totalBlocks = allocator->bam.size();
+    u32 startBlock = (u32)(startPos / blockSize);
+    u32 endBlock = (u32)((endPos + blockSize - 1) / blockSize);
+    if (endBlock > totalBlocks) endBlock = totalBlocks;
+
+    // Check if any blocks in this range are RESERVED (frozen/pinned) — if so, can't vaccum
+    for (u32 b = startBlock; b < endBlock; ++b) {
+        if (allocator->bam[b].getStatus() == BlockStatus::RESERVED) {
+            return false;
+        }
+    }
+
+    // Move any blobs out of this range
+    if (blobStore) {
+        Array<String> blobsToMove;
+        for (auto it = blobStore->index.begin(); it != blobStore->index.end(); ++it) {
+            if (it->value.frozen) continue; // Don't move frozen blobs
+            u32 cur = it->value.blockIdx;
+            bool inRange = false;
+            while (cur != 0) {
+                if (cur >= startBlock && cur < endBlock) { inRange = true; break; }
+                String blk = device->readBlock(cur, 0);
+                if ((u32)blk.size() >= 19) {
+                    const u8* ptr = (const u8*)blk.data();
+                    ptr++; u8 isF = *ptr++; u8 kLen = *ptr++;
+                    if (isF) ptr += kLen;
+                    ptr += 8;
+                    cur = *(const u32*)ptr;
+                } else { cur = 0; }
+            }
+            if (inRange) blobsToMove.push(it->key);
+        }
+        for (usz i = 0; i < blobsToMove.size(); ++i) {
+            String data = blobStore->readHash(blobsToMove[i], 0, 0);
+            // Mark target blocks reserved so allocator doesn't use them
+            for (u32 b = startBlock; b < endBlock; ++b) {
+                if (allocator->bam[b].getStatus() == BlockStatus::USED) {
+                    allocator->bam[b].setStatus(BlockStatus::RESERVED);
+                }
+            }
+            blobStore->removeHash(blobsToMove[i]);
+            blobStore->writeHash(blobsToMove[i], 0, data, "");
+            // Unmark reserved blocks
+            for (u32 b = startBlock; b < endBlock; ++b) {
+                if (allocator->bam[b].getStatus() == BlockStatus::RESERVED &&
+                    allocator->bam[b].getType() != BlockType::RAW) {
+                    allocator->freeBlock(b);
+                }
+            }
+        }
+    }
+
+    // Free remaining used blocks in range (tombstones, old data)
+    for (u32 b = startBlock; b < endBlock; ++b) {
+        if (allocator->bam[b].getStatus() == BlockStatus::USED) {
+            allocator->freeBlock(b);
+        }
+    }
+
+    // Run GC
+    if (journal && tableStore) {
+        u64 oldest = journal->oldestActiveSnapshot();
+        tableStore->gcVersions(oldest);
+    }
+    allocator->buildHeap();
+    allocator->saveBam();
+    return true;
+}
+
+bool XylemEngine::freeze(u64 startPos, u64 endPos) {
+    ensureMounted();
+    if (!allocator || !device) return false;
+    // First vacuum the region
+    if (!vaccum(startPos, endPos)) return false;
+    // Then mark all blocks as RESERVED
+    u32 blockSize = device->config.blockSize;
+    u32 startBlock = (u32)(startPos / blockSize);
+    u32 endBlock = (u32)((endPos + blockSize - 1) / blockSize);
+    u32 totalBlocks = allocator->bam.size();
+    if (endBlock > totalBlocks) endBlock = totalBlocks;
+    for (u32 b = startBlock; b < endBlock; ++b) {
+        allocator->bam[b].setStatus(BlockStatus::RESERVED);
+        allocator->bam[b].setType(BlockType::RAW);
+    }
+    allocator->buildHeap();
+    allocator->saveBam();
+    return true;
+}
+
+bool XylemEngine::thaw(u64 startPos, u64 endPos) {
+    ensureMounted();
+    if (!allocator || !device) return false;
+    u32 blockSize = device->config.blockSize;
+    u32 startBlock = (u32)(startPos / blockSize);
+    u32 endBlock = (u32)((endPos + blockSize - 1) / blockSize);
+    u32 totalBlocks = allocator->bam.size();
+    if (endBlock > totalBlocks) endBlock = totalBlocks;
+    for (u32 b = startBlock; b < endBlock; ++b) {
+        if (allocator->bam[b].getStatus() == BlockStatus::RESERVED &&
+            allocator->bam[b].getType() == BlockType::RAW) {
+            allocator->bam[b].setStatus(BlockStatus::FREE);
+            allocator->bam[b].setType(BlockType::FREE);
+        }
+    }
+    allocator->buildHeap();
+    allocator->saveBam();
+    return true;
+}
+
+bool XylemEngine::freeze(u64 startPos, const String& data) {
+    ensureMounted();
+    return fixRaw(startPos, data);
+}
+
+// ─── File-like convenience API ────────────────────────────────────────────────
+
+QueryResult XylemEngine::cat(const String& path, u64 start, u64 end) {
+    ensureMounted();
+    // Resolve path to get the content column
+    Array<GraphOp> ops = QueryParser::parseExtract(path);
+    if (ops.size() == 0) return QueryResult();
+
+    Collection::TreeBranch* tree = graphRead(Array<String>(), ops, 0, 0);
+    QueryResult res;
+    if (!tree || tree->size() == 0) {
+        res.code = -1;
+        if (tree) delete tree;
+        return res;
+    }
+
+    // Navigate to deepest node to get content
+    Collection::TreeItem* item = (*tree)[0];
+    while (item) {
+        RowNode* rn = dynamic_cast<RowNode*>(item);
+        if (rn) {
+            if (rn->size() > 0) {
+                item = (*rn)[0];
+                continue;
+            }
+            // Found leaf
+            if (rn->row.has("content")) {
+                String content = *rn->row.get("content");
+                if (start > 0 || end > 0) {
+                    u64 s = start;
+                    u64 e = (end > 0) ? end : (u64)content.size();
+                    if (e > (u64)content.size()) e = (u64)content.size();
+                    if (s < e) content = content.slice((usz)s, (usz)e);
+                    else content = "";
+                }
+                Map<String, String> row;
+                row.set("content", content);
+                res.readRows.push(row);
+            }
+            break;
+        }
+        Collection::TreeBranch* tb = dynamic_cast<Collection::TreeBranch*>(item);
+        if (tb && tb->size() > 0) {
+            item = (*tb)[0];
+        } else {
+            break;
+        }
+    }
+    res.code = res.readRows.size() > 0 ? 0 : -1;
+    delete tree;
+    return res;
+}
+
+QueryResult XylemEngine::tee(const String& path, const String& content, u64 start, u64 end) {
+    ensureMounted();
+    // Parse path into parts
+    Array<String> parts = path.split("/");
+    Array<String> cleanParts;
+    for (usz i = 0; i < parts.size(); ++i) {
+        if (!parts[i].isEmpty()) cleanParts.push(parts[i]);
+    }
+    if (cleanParts.size() == 0) return QueryResult();
+
+    // Build graph ops: create directories as needed, then set content
+    Array<GraphOp> ops = QueryParser::parseExtract(path);
+
+    // Add SET op with content
+    GraphOp setOp;
+    setOp.type = GraphOpType::SET;
+    Clause contentClause;
+    contentClause.col = "content:blob";
+    contentClause.op = "=";
+    contentClause.val = content;
+    setOp.writeSet.push(contentClause);
+    ops.push(setOp);
+
+    QueryResult res;
+    res.code = graphWrite(ops, 0, "");
+    flush();
+    return res;
+}
+
+QueryResult XylemEngine::ls(const String& path) {
+    ensureMounted();
+    QueryResult res;
+
+    if (path.isEmpty() || path == "/") {
+        Array<String> lsCols; lsCols.push("id"); lsCols.push("name"); lsCols.push("parent_id"); lsCols.push("type"); lsCols.push("perms");
+        Array<Clauses> lsWhere; lsWhere.push(WHERE("parent_id", "=", "0"));
+        res.readRows = read(lsCols, lsWhere);
+    } else {
+        // Resolve path to get parent id, then list children
+        Array<GraphOp> ops = QueryParser::parseExtract(path);
+        Array<String> idCols; idCols.push("id");
+        Collection::TreeBranch* tree = graphRead(idCols, ops, 0, 0);
+        if (tree && tree->size() > 0) {
+            // Get id of deepest matched node
+            Collection::TreeItem* item = (*tree)[0];
+            String dirId;
+            while (item) {
+                RowNode* rn = dynamic_cast<RowNode*>(item);
+                if (rn) {
+                    if (rn->size() > 0) {
+                        item = (*rn)[0];
+                        continue;
+                    }
+                    if (rn->row.has("id")) dirId = *rn->row.get("id");
+                    break;
+                }
+                Collection::TreeBranch* tb = dynamic_cast<Collection::TreeBranch*>(item);
+                if (tb && tb->size() > 0) { item = (*tb)[0]; } else { break; }
+            }
+            if (!dirId.isEmpty()) {
+                Array<String> lsCols2; lsCols2.push("id"); lsCols2.push("name"); lsCols2.push("parent_id"); lsCols2.push("type"); lsCols2.push("perms");
+                Array<Clauses> lsWhere2; lsWhere2.push(WHERE("parent_id", "=", dirId));
+                res.readRows = read(lsCols2, lsWhere2);
+            }
+            delete tree;
+        }
+    }
+    res.code = (int)res.readRows.size();
+    return res;
+}
+
+bool XylemEngine::unlink(const String& path) {
+    ensureMounted();
+    if (!tableStore) return false;
+
+    // Resolve path
+    Array<String> parts = path.split("/");
+    Array<String> cleanParts;
+    for (usz i = 0; i < parts.size(); ++i) {
+        if (!parts[i].isEmpty()) cleanParts.push(parts[i]);
+    }
+    if (cleanParts.size() == 0) return false;
+
+    // Walk the path to find the item
+    String currentId = "0";
+    for (usz i = 0; i < cleanParts.size(); ++i) {
+        Array<String> idCols; idCols.push("id");
+        Array<Clauses> findWhere; findWhere.push(WHERE("parent_id", "=", currentId)
+                                  && WHERE("name", "=", cleanParts[i]));
+        auto rows = read(idCols, findWhere);
+        if (rows.size() == 0 || !rows[0].has("id")) return false;
+        currentId = *rows[0].get("id");
+    }
+
+    // Recursively remove children
+    Array<u64> stack;
+    // Parse currentId to u64
+    u64 targetId = 0;
+    for (usz i = 0; i < currentId.size(); ++i) {
+        if (currentId[i] >= '0' && currentId[i] <= '9')
+            targetId = targetId * 10 + (currentId[i] - '0');
+    }
+
+    // Remove children recursively
+    Array<String> childCols; childCols.push("id");
+    Array<Clauses> childWhere; childWhere.push(WHERE("parent_id", "=", currentId));
+    auto childRows = read(childCols, childWhere);
+    for (usz i = 0; i < childRows.size(); ++i) {
+        if (childRows[i].has("id")) {
+            unlink(path + "/" + *childRows[i].get("id"));
+        }
+    }
+
+    // Remove this item
+    Array<Clauses> removeWhere; removeWhere.push(WHERE("id", "=", currentId));
+    bool r = remove(removeWhere);
+    flush();
+    return r;
+}
+
 // ─── Watch / Pull ─────────────────────────────────────────────────────────────
 
 u64 XylemEngine::watch(const Array<Clauses>& clauses) {
+    ensureMounted();
     return watcher ? watcher->watch(clauses) : 0;
 }
 
 u64 XylemEngine::watch(const Array<Clauses>& clauses, Func<void(Map<String,String>)> cb) {
+    ensureMounted();
     return watcher ? watcher->watch(clauses, cb) : 0;
 }
 

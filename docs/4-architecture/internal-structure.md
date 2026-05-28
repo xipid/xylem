@@ -21,12 +21,14 @@ xylem/
     *   Defines the `BlockDevice` interface and custom read/write hooks. Simulated as POSIX files or memory blocks.
 *   `Allocator.hpp` / `Allocator.cpp`
     *   Handles low-level physical block allocation and reclaiming. Implements wear-leveling algorithms.
+    *   **Auto-Expansion:** If `deviceExpands = true` is set on the configuration, Xylem can dynamically request external storage growth (e.g. via `ftruncate`) in `4MB` chunks (1024 blocks). This prevents fragmentation and allows databases to start at 0 bytes and cleanly grow forever.
 *   `Format.hpp`
     *   Sets structural layouts, block headers, and geometry boundaries.
 
 ### 2. Relational & Schema Core
 *   `TableStore.hpp` / `TableStore.cpp`
     *   Creates tables dynamically from signatures. Handles page management, row insertions, edits, deletions (tombstones), and MVCC snapshots.
+    *   **Transaction Batching:** Table operations can be wrapped in `xm.lock()` and `xm.unlock()` routines to drastically bundle bulk insertions/mutations inside a single memory snapshot. This minimizes B+Tree traversal and journaling bottlenecks by combining hundreds of operations per physical flush.
 *   `Cache.hpp` / `Cache.cpp`
     *   Maintains a dirty-page cache using an LRU eviction strategy. Flushes modified blocks back to the physical layer.
 

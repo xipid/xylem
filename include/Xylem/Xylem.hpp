@@ -36,8 +36,9 @@ public:
 
     bool format();
     bool mount();
-    void unmount();
+    void destroy();
     void flush();
+    bool isMounted() const;
 
     // ─── Query Parser ────────────────────────────────────────────────────────
     QueryResult query(const String& queryString, const Array<String>& sanitized = Array<String>());
@@ -65,26 +66,45 @@ public:
     bool rollback(u64 id);
     int  unlock(u64 id);
 
-    // ─── Blob API ────────────────────────────────────────────────────────────
+    // ─── Blob API (ref-based) ────────────────────────────────────────────────
 
-    // Auto-hash content, CAS dedup. Returns the 16-byte hash.
+    u32 getBlobRef(const String& hash);
+    String getBlob(u32 ref);
+    u32 getBlobSize(u32 ref);
+    void writeBlob(u32 ref, const String& content, u64 start = 0);
+    String readBlob(u32 ref, u64 start = 0, u64 end = 0);
+    void setBlob(u32 ref, const String& hash);
+    String setBlob(u32 ref);
+    bool freezeBlob(u64 position, u32 blobRef);
+    void thawBlob(u32 blobRef);
+
+    // Internal hash-based blob (kept for engine internals)
     String writeHash(const String& content);
-    // Store with user-provided hash. Returns the hash.
     String writeHash(const String& content, const String& hash);
-    // Write content at a fixed position. Returns hash. Rejects if overlap.
     String writeHash(const String& content, u64 position);
-
-    // Pin existing blob at byte address. Returns 0=ok, -1=overlap/error.
     int fixHash(const String& hash, u64 position);
-    // Force remove blob.
     bool removeHash(const String& hash);
-    // Read blob content.
     String readHash(const String& hash, u64 min = 0, u64 max = 0);
-    // Stat blob (returns original size as string).
-    String statHash(const String& hash);
 
     // Pin raw data at block address (relocating system blocks if needed)
     bool fixRaw(u64 byteAddress, const String& rawData);
+
+    // ─── Vacuum / Freeze / Thaw ─────────────────────────────────────────────
+
+    void vaccum();                                  // Shrink from end
+    bool vaccum(u64 startPos);                      // Vaccum from startPos to end
+    bool vaccum(u64 startPos, u64 endPos);           // Vaccum region
+
+    bool freeze(u64 startPos, u64 endPos);           // Prevent Xylem from writing here
+    bool thaw(u64 startPos, u64 endPos);             // Allow Xylem to write here again
+    bool freeze(u64 startPos, const String& data);   // Freeze + write raw data (replaces fixRaw public use)
+
+    // ─── File-like convenience API ──────────────────────────────────────────
+
+    QueryResult cat(const String& path, u64 start = 0, u64 end = 0);
+    QueryResult tee(const String& path, const String& content, u64 start = 0, u64 end = 0);
+    QueryResult ls(const String& path = "");
+    bool unlink(const String& path);
 
     // ─── Reactivity ─────────────────────────────────────────────────────────
 
@@ -92,6 +112,9 @@ public:
     u64 watch(const Array<Clauses>& clauses, Func<void(Map<String,String>)> cb);
     bool unwatch(u64 id);
     Array<Map<String,String>> pull(u64 id);
+
+private:
+    void ensureMounted();
 };
 
 } // namespace Xylem

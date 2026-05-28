@@ -181,8 +181,8 @@ QueryResult QueryParser::execute(XylemEngine* engine, const String& queryStr, co
         res.code = engine->mount() ? 0 : -1;
         return res;
     }
-    if (cmd == "UNMOUNT") {
-        engine->unmount();
+    if (cmd == "DESTROY") {
+        engine->destroy();
         res.code = 0;
         return res;
     }
@@ -202,26 +202,101 @@ QueryResult QueryParser::execute(XylemEngine* engine, const String& queryStr, co
         return res;
     }
 
-    // Graph Commands (GR, GW, ER, EW, VRW, VGW, VEW)
-    if (cmd == "GRAPHREAD" || cmd == "GR" || cmd == "ER" || 
-        cmd == "GRAPHWRITE" || cmd == "GW" || cmd == "EW" || 
-        cmd == "GRAPHWRITEVOLATILE" || cmd == "VGW" || cmd == "VEW") {
+    // Parse range spec from command: CMD[x:y] or CMD[:y] or CMD[x:]
+    auto parseCmdRange = [](const String& cmdStr) -> BlobRange {
+        BlobRange r = {0, 0, false, false, false};
+        long long bracket = -1;
+        for (usz i = 0; i < cmdStr.size(); ++i) {
+            if (cmdStr[i] == '[') { bracket = (long long)i; break; }
+        }
+        if (bracket < 0) return r;
+        String rangeSpec = cmdStr.slice(bracket);
+        return parseBlobRange(rangeSpec);
+    };
+
+    // Extract base command name without range spec
+    auto baseCmdName = [](const String& cmdStr) -> String {
+        for (usz i = 0; i < cmdStr.size(); ++i) {
+            if (cmdStr[i] == '[') return cmdStr.slice(0, i);
+        }
+        return cmdStr;
+    };
+
+    String baseCmd = baseCmdName(tokens[0]).toUpperCase();
+    BlobRange cmdRange = parseCmdRange(tokens[0]);
+
+    // ─── CAT command ───
+    if (baseCmd == "CAT") {
+        if (tokens.size() < 2) { res.code = -1; return res; }
+        String path = tokens[1];
+        u64 start = cmdRange.valid ? cmdRange.start : 0;
+        u64 end   = cmdRange.valid ? cmdRange.end : 0;
+
+        // Check for additional WHERE/ASSERT/FOLLOW clauses
+        // For now, delegate to engine->cat()
+        res = engine->cat(path, start, end);
+        return res;
+    }
+
+    // ─── TEE command ───
+    if (baseCmd == "TEE") {
+        if (tokens.size() < 3) { res.code = -1; return res; }
+        String path = tokens[1];
+        // Gather content from remaining tokens
+        String content;
+        for (usz i = 2; i < tokens.size(); ++i) {
+            if (i > 2) content += " ";
+            content += tokens[i];
+        }
+        u64 start = cmdRange.valid ? cmdRange.start : 0;
+        u64 end   = cmdRange.valid ? cmdRange.end : 0;
+        res = engine->tee(path, content, start, end);
+        return res;
+    }
+
+    // ─── LS command ───
+    if (baseCmd == "LS") {
+        String path = tokens.size() >= 2 ? tokens[1] : "";
+        res = engine->ls(path);
+        return res;
+    }
+
+    // ─── UNLINK command ───
+    if (baseCmd == "UNLINK") {
+        if (tokens.size() < 2) { res.code = -1; return res; }
+        String path = tokens[1];
+        res.code = engine->unlink(path) ? 0 : -1;
+        return res;
+    }
+
+    // ─── VACCUM command ───
+    if (baseCmd == "VACCUM") {
+        if (cmdRange.valid) {
+            if (cmdRange.end > 0) {
+                res.code = engine->vaccum(cmdRange.start, cmdRange.end) ? 0 : -1;
+            } else {
+                res.code = engine->vaccum(cmdRange.start) ? 0 : -1;
+            }
+        } else {
+            engine->vaccum();
+            res.code = 0;
+        }
+        return res;
+    }
+
+    // Graph Commands (GR, GW, VGW)
+    if (cmd == "GRAPHREAD" || cmd == "GR" ||
+        cmd == "GRAPHWRITE" || cmd == "GW" ||
+        cmd == "GRAPHWRITEVOLATILE" || cmd == "VGW") {
         
-        bool isWrite = (cmd == "GRAPHWRITE" || cmd == "GW" || cmd == "EW" || cmd == "GRAPHWRITEVOLATILE" || cmd == "VGW" || cmd == "VEW");
-        bool isVolatile = (cmd == "GRAPHWRITEVOLATILE" || cmd == "VGW" || cmd == "VEW");
+        bool isWrite = (cmd == "GRAPHWRITE" || cmd == "GW" || cmd == "GRAPHWRITEVOLATILE" || cmd == "VGW");
+        bool isVolatile = (cmd == "GRAPHWRITEVOLATILE" || cmd == "VGW");
         
         Array<GraphOp> ops;
         Array<String> columns;
         usz idx = 1;
         
-        // Handle ER / EW aliases which strictly imply EXTRACT next
-        if (cmd == "ER" || cmd == "EW" || cmd == "VEW") {
-            if (idx < tokens.size()) {
-                ops = parseExtract(tokens[idx]);
-                idx++;
-            }
-        }
-        
+        // Handle EXTRACT keyword
         while (idx < tokens.size()) {
             String t = tokens[idx];
             String tu = t.toUpperCase();

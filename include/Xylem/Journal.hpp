@@ -64,7 +64,11 @@ public:
     Journal(BlockDevice* dev, Allocator* alloc);
 
     void initFromFormat(u16 startBlock, u16 count, u64 seq);
-    void recover(); // Scans WAL on mount; detects incomplete transactions
+    void recover(class TableStore* ts); // Scans WAL on mount; replays pending writes into TableStore
+
+    bool isNearingCapacity() const {
+        return currentJournalBlock >= journalStartBlock + journalBlockCount - 1;
+    }
 
     // Low-level atomic write-ahead
     void append(JournalOpType op, u16 targetBlock, const String& payload);
@@ -82,6 +86,12 @@ public:
 
     // Get the oldest snapshot sequence across all active locks
     u64 oldestActiveSnapshot() const;
+
+    // Serialization for WAL
+    static String serializeTableWrite(const Array<Clause>& columns, const Array<Clauses>& clauses, const String& encryptionKey);
+    static String serializeTableRemove(const Array<Clauses>& clauses, u64 length);
+    static String serializeGraphWrite(const Array<GraphOp>& ops, const String& encryptionKey);
+    static void deserializeAndApply(TableStore* ts, JournalOpType type, const String& payload);
 
 private:
     void writeToFlash(const Array<JournalEntry>& entries);

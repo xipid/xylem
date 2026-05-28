@@ -109,7 +109,8 @@ int main() {
     String blobHash = xm.writeHash(massivePayload);            // Auto-hash
     String blobHash2 = xm.writeHash(massivePayload);           // Duplicate CAS
     
-    Info("Deduplicated Blob Stat Size: " + xm.statHash(blobHash) + " bytes (Expected: 102400)");
+    u32 blobStatRef = xm.getBlobRef(blobHash);
+    Info("Deduplicated Blob Stat Size: " + String::from((u64)xm.getBlobSize(blobStatRef)) + " bytes (Expected: 102400)");
     if (blobHash == blobHash2) Success("CAS hashes match.");
     else Error("CAS hashes differ!");
 
@@ -271,7 +272,7 @@ int main() {
 
     // Test 11: On-Demand Graph Loading (Reboot) — now with HNSW persistence
     Info("Test 11: On-Demand Graph Loading (Reboot)");
-    xm.unmount();
+    xm.destroy();
     
     Info("Remounting Xylem Database (HNSW nodes persisted to disk)...");
     xm.mount();
@@ -347,7 +348,7 @@ int main() {
     }
 
     Info("Rebooting after dynamic system relocation...");
-    xm.unmount();
+    xm.destroy();
     bool mountSuccess = xm.mount();
     if (!mountSuccess) Error("Failed to mount after dynamic system relocation!");
     else {
@@ -413,15 +414,17 @@ int main() {
     
     // Delete one — blob should survive (still referenced by ref2)
     xm.remove(OR(WHERE("ref_id", "=", "ref1")));
-    String afterDel1 = xm.statHash(refHash);
-    if (!afterDel1.isEmpty()) Success("Blob survived single-ref deletion (still referenced).");
+    u32 afterDel1Ref = xm.getBlobRef(refHash);
+    u32 afterDel1Sz = xm.getBlobSize(afterDel1Ref);
+    if (afterDel1Sz > 0) Success("Blob survived single-ref deletion (still referenced).");
     else Error("Blob was prematurely deleted!");
     
     // Delete the other — blob should now be cleaned up
     xm.remove(OR(WHERE("ref_id", "=", "ref2")));
-    String afterDel2 = xm.statHash(refHash);
-    if (afterDel2.isEmpty()) Success("Blob correctly cleaned up when all references removed.");
-    else Info("Blob still exists after all refs removed (stat=" + afterDel2 + ") — may be expected if hash is system-used.");
+    u32 afterDel2Ref = xm.getBlobRef(refHash);
+    u32 afterDel2Sz = xm.getBlobSize(afterDel2Ref);
+    if (afterDel2Sz == 0) Success("Blob correctly cleaned up when all references removed.");
+    else Info("Blob still exists after all refs removed (size=" + String::from((u64)afterDel2Sz) + ") — may be expected if hash is system-used.");
     // --- Test 18: Volatile Rows ---
     Info("Test 18: Volatile Rows (In-Memory Only)");
     Array<Clause> volRow;
@@ -434,10 +437,10 @@ int main() {
     else Error("Volatile row not found in memory!");
     
     // Unmount and remount to prove it vanishes
-    xm.unmount();
+    xm.destroy();
     xm.mount();
     auto vResAfter = xm.read(vCols, OR(WHERE("volatile_key", "=", "vol_val")));
-    if (vResAfter.size() == 0) Success("Volatile row successfully vanished after unmount/power-loss!");
+    if (vResAfter.size() == 0) Success("Volatile row successfully vanished after destroy/power-loss!");
     else Error("Volatile row incorrectly persisted to disk!");
     Success("All rigorous tests successfully passed!");
     close(fd);

@@ -133,3 +133,27 @@ void setupXylemFlash() {
     xm.mount();
 }
 ```
+
+## 4. The Interactive CLI (`xy`)
+Xylem ships with a powerful interactive CLI tool for exploring and managing databases natively from your terminal.
+
+### Building the CLI
+To build the `xy` binary, simply compile the project:
+```bash
+./build.sh
+```
+
+### Running the CLI
+Mount any database file to start an interactive session:
+```bash
+./build/xy dev/my_database.xy
+```
+The CLI provides **native arrow key history navigation**, **inline text editing**, and **syntax-highlighted colorized YAML output**.
+
+### Useful CLI Commands
+- `ls [path]`: View directory contents and file metadata.
+- `cat [path]`: Print the exact binary/text blob content of a file.
+- `cd [path]`: Move through the virtual hierarchy (automatically creating directories with `mkdir -p` behavior if they don't exist).
+- `IO <linux_path> <xylem_path>`: Recursively bulk-import an entire Linux directory tree into Xylem. This operates using highly optimized transactional batching (200 ops/lock) for blazingly fast ingestion.
+- `UNLINK <xylem_path>`: Safely and recursively wipe an entire directory and all its descendants from the database.
+- `READ ...`: Execute raw query language statements directly.

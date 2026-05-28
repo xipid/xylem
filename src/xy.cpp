@@ -15,6 +15,7 @@ using namespace Terminal;
 using namespace Xylem;
 
 #include <Xi/Random.hpp>
+#include <Terminal/Prompt.hpp>
 
 String toHexString(const String& data) {
     const char* hexChars = "0123456789abcdef";
@@ -169,11 +170,40 @@ TreeItem* convertToYamlTree(const TreeItem* node) {
     return node->clone();
 }
 
+String colorizeYAML(const String& yaml) {
+    if (!isatty(fileno(stdout))) return yaml;
+    
+    String res;
+    Array<String> lines = yaml.split("\n");
+    for (usz i = 0; i < lines.size(); ++i) {
+        String line = lines[i];
+        if (line.isEmpty() && i == lines.size() - 1) continue;
+        
+        bool hasColon = false;
+        usz colonIdx = 0;
+        for (usz j = 0; j < line.size(); ++j) {
+            if (line[j] == ':') {
+                hasColon = true;
+                colonIdx = j;
+                break;
+            }
+        }
+        if (hasColon) {
+            String prefix = line.slice(0, colonIdx);
+            String suffix = line.slice(colonIdx + 1, line.size());
+            res += "\033[36m" + prefix + "\033[0m:\033[32m" + suffix + "\033[0m\n";
+        } else {
+            res += line + "\n";
+        }
+    }
+    return res;
+}
+
 void printResult(const QueryResult& res) {
     if (res.treeResult) {
         printf("Graph Result Node Count: %llu\n", (unsigned long long)res.treeResult->size());
         TreeItem* yamlRoot = convertToYamlTree(res.treeResult);
-        printf("%s\n", Encoding::toYAML(*yamlRoot).c_str());
+        printf("%s", colorizeYAML(Encoding::toYAML(*yamlRoot)).c_str());
         delete yamlRoot;
         delete res.treeResult;
     } else if (res.readRows.size() > 0) {
@@ -192,7 +222,7 @@ void printResult(const QueryResult& res) {
             }
             root.add(tb);
         }
-        printf("%s\n", Encoding::toYAML(root).c_str());
+        printf("%s", colorizeYAML(Encoding::toYAML(root)).c_str());
         if (res.readRows.size() > 100) printf("  ... (+%llu more)\n", (unsigned long long)(res.readRows.size() - 100));
     } else {
         if (res.code != 0) printf("Result Code: %d\n", res.code);
@@ -215,7 +245,13 @@ int main(int argc, char** argv) {
     }
 
     XylemEngine xm;
-    xm.config.deviceSize = 1024 * 1024 * 50;
+    struct stat st;
+    if (stat((const char*)dbPath.data(), &st) == 0 && st.st_size > 0) {
+        xm.config.deviceSize = st.st_size;
+    } else {
+        xm.config.deviceSize = 0; // Starts at minimum, expands
+    }
+    xm.config.deviceExpands = true;
     xm.config.blockSize = 4096;
     xm.config.readSize = 4096;
     xm.config.writeSize = 4096;
@@ -260,23 +296,21 @@ int main(int argc, char** argv) {
     printf("Successfully mounted Xylem database at %s.\n", dbPath.data());
 
     // Interactive Loop
+    bool isInteractive = isatty(fileno(stdin));
     String pwd = "/";
     String line;
-    char buffer[4096];
-    
+    Array<String> commandHistory;
+
     while (true) {
-        printf("> ");
-        if (!std::fgets(buffer, sizeof(buffer), stdin)) break;
-        
-        line = buffer;
-        if (line.endsWith("\n")) line = line.slice(0, line.size() - 1);
-        if (line.endsWith("\r")) line = line.slice(0, line.size() - 1);
-        
+        line = Terminal::Prompt::readLine("> ", &commandHistory);
+        if (line == "\x04" || line == "\x03") break;
+
         if (line.isEmpty()) continue;
         
         String uLine = line.toUpperCase();
         if (uLine == "EXIT" || uLine == "QUIT") break;
 
+        // pwd and cd are xy-binary specific
         Array<String> tokens = QueryParser::tokenize(line, Array<String>());
         if (tokens.size() == 0) continue;
         
@@ -298,7 +332,30 @@ int main(int argc, char** argv) {
                             printf("Error: %s is not a directory.\n", targetPath.c_str());
                         }
                     } else {
-                        printf("Error: Directory %s not found.\n", targetPath.c_str());
+                        // Automatically create directories like mkdir -p
+                        Array<String> parts = targetPath.split("/");
+                        Array<String> cleanParts;
+                        for (usz i = 0; i < parts.size(); ++i) if (!parts[i].isEmpty()) cleanParts.push(parts[i]);
+                        
+                        String currentParentId = "0";
+                        for (usz i = 0; i < cleanParts.size(); ++i) {
+                            String partName = cleanParts[i];
+                            String q = "READ id WHERE name=%1 parent_id=%2";
+                            Array<String> a; a.push(partName); a.push(currentParentId);
+                            QueryResult r = xm.query(q, a);
+                            
+                            if (r.readRows.size() > 0 && r.readRows[0].has("id")) {
+                                currentParentId = *r.readRows[0].get("id");
+                            } else {
+                                u64 rnd = ((u64)Xi::randomNext() << 32) | Xi::randomNext();
+                                String newId(rnd);
+                                String wq = "WRITE name=%1 parent_id=%2 id=%3 type=dir perms=755";
+                                Array<String> wa; wa.push(partName); wa.push(currentParentId); wa.push(newId);
+                                xm.query(wq, wa);
+                                currentParentId = newId;
+                            }
+                        }
+                        pwd = targetPath;
                     }
                 }
             }
@@ -310,207 +367,37 @@ int main(int argc, char** argv) {
             continue;
         }
 
-        if (cmd == "LS") {
-            String pathArg = tokens.size() >= 2 ? tokens[1] : "";
-            String targetPath = pathArg.isEmpty() ? pwd : resolvePath(pwd, pathArg);
-            if (targetPath == "/") {
-                String query = "READ id name parent_id type perms WHERE parent_id=0";
-                QueryResult qr = xm.query(query);
-                printResult(qr);
-            } else {
-                String dirId = getPathId(xm, targetPath);
-                if (dirId.isEmpty()) {
-                    printf("Error: Path %s not found.\n", targetPath.c_str());
-                } else {
-                    Map<String, String> row;
-                    if (getPathRow(xm, targetPath, row) && row.has("type") && *row.get("type") == "dir") {
-                        String query = "READ id name parent_id type perms WHERE parent_id=%1";
-                        Array<String> args;
-                        args.push(dirId);
-                        QueryResult qr = xm.query(query, args);
-                        printResult(qr);
-                    } else {
-                        String query = "READ id name parent_id type perms WHERE id=%1";
-                        Array<String> args;
-                        args.push(dirId);
-                        QueryResult qr = xm.query(query, args);
-                        printResult(qr);
-                    }
-                }
-            }
-            continue;
-        }
-
-        if (cmd == "EW") {
-            if (tokens.size() < 2) {
-                printf("Error: ew requires <path> [content]\n");
-                continue;
-            }
-            String targetPath = resolvePath(pwd, tokens[1]);
-            String content = "";
-            if (tokens.size() >= 3) {
-                for (usz i = 2; i < tokens.size(); ++i) {
-                    if (i > 2) content += " ";
-                    content += tokens[i];
-                }
-            }
-            Array<String> parts = targetPath.split("/");
-            Array<String> cleanParts;
-            for (usz i = 0; i < parts.size(); ++i) if (!parts[i].isEmpty()) cleanParts.push(parts[i]);
-            
-            if (cleanParts.size() > 0) {
-                String currentParentId = "0";
-                for (usz i = 0; i < cleanParts.size() - 1; ++i) {
-                    String partName = cleanParts[i];
-                    String q = "READ id WHERE name=%1 parent_id=%2";
-                    Array<String> a; a.push(partName); a.push(currentParentId);
-                    QueryResult r = xm.query(q, a);
-                    
-                    bool found = false;
-                    if (r.readRows.size() > 0 && r.readRows[0].has("id")) {
-                        currentParentId = *r.readRows[0].get("id");
-                        found = true;
-                    }
-                    
-                    if (!found) {
-                        u64 rnd = ((u64)Xi::randomNext() << 32) | Xi::randomNext();
-                        String newId(rnd);
-                        String wq = "WRITE name=%1 parent_id=%2 id=%3 type=dir perms=755";
-                        Array<String> wa; wa.push(partName); wa.push(currentParentId); wa.push(newId);
-                        xm.query(wq, wa);
-                        currentParentId = newId;
-                    }
-                }
-                
-                String fileName = cleanParts[cleanParts.size() - 1];
-                String fileIdQuery = "READ id WHERE name=%1 parent_id=%2";
-                Array<String> fa; fa.push(fileName); fa.push(currentParentId);
-                QueryResult rFile = xm.query(fileIdQuery, fa);
-                
-                bool fileFound = false;
-                String fileId;
-                if (rFile.readRows.size() > 0 && rFile.readRows[0].has("id")) {
-                    fileFound = true;
-                    fileId = *rFile.readRows[0].get("id");
-                }
-                
-                if (fileFound) {
-                    Array<String> args; args.push(fileId); args.push(content);
-                    xm.query("WRITE content:blob=%2 WHERE id=%1", args);
-                } else {
-                    u64 rnd = ((u64)Xi::randomNext() << 32) | Xi::randomNext();
-                    fileId = String(rnd);
-                    Array<String> args; args.push(fileName); args.push(currentParentId); args.push(fileId); args.push(content);
-                    xm.query("WRITE name=%1 parent_id=%2 id=%3 type=file content:blob=%4 perms=644", args);
-                }
-                xm.flush();
-            }
-            continue;
-        }
-
-        if (cmd == "ER") {
-            if (tokens.size() < 2) {
-                printf("Error: er requires <path>\n");
-                continue;
-            }
-            String targetPath = resolvePath(pwd, tokens[1]);
-            String q = "GR EXTRACT \"" + targetPath + "\"";
-            QueryResult res = xm.query(q);
-            printResult(res);
-            continue;
-        }
-
         if (cmd == "CAT") {
             if (tokens.size() < 2) {
-                printf("Error: cat requires <path>\n");
+                printf("Error: CAT requires <path>\n");
                 continue;
             }
             String targetPath = resolvePath(pwd, tokens[1]);
-            String id = getPathId(xm, targetPath);
-            if (id.isEmpty()) {
-                printf("Error: File %s not found.\n", targetPath.c_str());
-            } else {
-                String query = "READ content WHERE id=%1";
-                Array<String> args;
-                args.push(id);
-                QueryResult qr = xm.query(query, args);
-                if (qr.readRows.size() > 0 && qr.readRows[0].has("content")) {
-                    String content = *qr.readRows[0].get("content");
-                    printf("%s\n", content.c_str());
-                } else {
-                    printf("Error: File is empty or not readable.\n");
-                }
+            QueryResult res = xm.query("CAT \"" + targetPath + "\"");
+            bool printed = false;
+            if (res.readRows.size() > 0 && res.readRows[0].has("content")) {
+                printf("%s\n", res.readRows[0].get("content")->c_str());
+                printed = true;
             }
-            continue;
-        }
-
-        if (cmd == "ED") {
-            if (tokens.size() < 2) {
-                printf("Error: ed requires <path>\n");
-                continue;
+            if (!printed) {
+                printf("Error: %s not found or has no content.\n", targetPath.c_str());
             }
-            String targetPath = resolvePath(pwd, tokens[1]);
-            String targetId = getPathId(xm, targetPath);
-            if (targetId.isEmpty()) {
-                printf("Error: Path %s not found.\n", targetPath.c_str());
-            } else {
-                recursiveRemove(xm, targetId);
-                xm.flush();
-            }
+            if (res.treeResult) delete res.treeResult;
             continue;
-        }
-
-        if (cmd == "EH") {
-            if (tokens.size() < 2) {
-                printf("Error: eh requires <path>\n");
-                continue;
-            }
-            String targetPath = resolvePath(pwd, tokens[1]);
-            Map<String, String> row;
-            if (getPathRow(xm, targetPath, row)) {
-                if (row.has("type") && *row.get("type") == "dir") {
-                    printf("Error: %s is a directory.\n", targetPath.c_str());
-                } else {
-                    String content = row.has("content") ? *row.get("content") : "";
-                    String h = Sec::hash(content, 32);
-                    String hex = toHexString(h);
-                    printf("%s\n", hex.c_str());
-                }
-            } else {
-                printf("Error: File %s not found.\n", targetPath.c_str());
-            }
-            continue;
-        }
-
-        if (cmd == "FLUSH") {
-            xm.flush();
-            printf("Database flushed.\n");
-            continue;
-        }
-
-        if (cmd == "UNMOUNT") {
-            xm.unmount();
-            printf("Database unmounted.\n");
-            continue;
-        }
-
-        if (cmd == "MOUNT") {
-            if (xm.mount()) {
-                printf("Database mounted.\n");
-            } else {
-                printf("Error: Failed to mount database.\n");
-            }
-            continue;
-        }
-
-        if (cmd == "IO") {
+        }        if (cmd == "IO") {
             if (tokens.size() < 3) {
                 printf("Error: IO requires <linux_path> <xylem_path>\n");
                 continue;
             }
             String linuxPath = tokens[1];
-            String xylemPath = resolvePath(pwd, tokens[2]);
+        String xylemPath = resolvePath(pwd, tokens[2]);
             
+            Map<String, String> dirCache;
+            dirCache.set("0", "0");
+            
+            u64 txId = xm.lock();
+            int txCount = 0;
+
             auto uploadFile = [&](const String& srcPath, const String& dstPath) {
                 std::ifstream file((const char*)srcPath.data(), std::ios::binary | std::ios::ate);
                 if (!file.is_open()) {
@@ -529,27 +416,31 @@ int main(int argc, char** argv) {
                     if (cleanParts.size() == 0) return;
                     
                     String currentParentId = "0";
+                    String currentPathStr = "/";
                     
-                    // Create directory structure if missing
+                    // Create directory structure if missing (using cache)
                     for (usz i = 0; i < cleanParts.size() - 1; ++i) {
                         String partName = cleanParts[i];
-                        String q = "READ id WHERE name=%1 parent_id=%2";
-                        Array<String> a; a.push(partName); a.push(currentParentId);
-                        QueryResult r = xm.query(q, a);
+                        currentPathStr += partName + "/";
                         
-                        bool found = false;
-                        if (r.readRows.size() > 0 && r.readRows[0].has("id")) {
-                            currentParentId = *r.readRows[0].get("id");
-                            found = true;
-                        }
-                        
-                        if (!found) {
-                            u64 rnd = ((u64)Xi::randomNext() << 32) | Xi::randomNext();
-                            String newId(rnd);
-                            String wq = "WRITE name=%1 parent_id=%2 id=%3 type=dir perms=755";
-                            Array<String> wa; wa.push(partName); wa.push(currentParentId); wa.push(newId);
-                            xm.query(wq, wa);
-                            currentParentId = newId;
+                        if (dirCache.has(currentPathStr)) {
+                            currentParentId = *dirCache.get(currentPathStr);
+                        } else {
+                            String q = "READ id WHERE name=%1 parent_id=%2";
+                            Array<String> a; a.push(partName); a.push(currentParentId);
+                            QueryResult r = xm.query(q, a);
+                            
+                            if (r.readRows.size() > 0 && r.readRows[0].has("id")) {
+                                currentParentId = *r.readRows[0].get("id");
+                            } else {
+                                u64 rnd = ((u64)Xi::randomNext() << 32) | Xi::randomNext();
+                                String newId(rnd);
+                                String wq = "WRITE name=%1 parent_id=%2 id=%3 type=dir perms=755";
+                                Array<String> wa; wa.push(partName); wa.push(currentParentId); wa.push(newId);
+                                xm.query(wq, wa); // Dirs are outside the batch tx for safety with READ
+                                currentParentId = newId;
+                            }
+                            dirCache.set(currentPathStr, currentParentId);
                         }
                     }
                     
@@ -565,14 +456,40 @@ int main(int argc, char** argv) {
                         fileId = *rFile.readRows[0].get("id");
                     }
                     
+                    String colName = (content.size() > 512) ? "content:blob" : "content";
+
                     if (fileFound) {
-                        Array<String> args; args.push(fileId); args.push(content);
-                        xm.query("WRITE content:blob=%2 WHERE id=%1", args);
+                        Array<Clause> writeCols;
+                        Clause cBlob; cBlob.col = colName; cBlob.op = "="; cBlob.val = content;
+                        writeCols.push(cBlob);
+                        
+                        Array<Clauses> queryClauses;
+                        Clauses group;
+                        Clause cId; cId.col = "id"; cId.op = "="; cId.val = fileId;
+                        group.push(cId);
+                        queryClauses.push(group);
+                        
+                        xm.write(writeCols, queryClauses, txId);
                     } else {
                         u64 rnd = ((u64)Xi::randomNext() << 32) | Xi::randomNext();
                         fileId = String(rnd);
-                        Array<String> args; args.push(fileName); args.push(currentParentId); args.push(fileId); args.push(content);
-                        xm.query("WRITE name=%1 parent_id=%2 id=%3 type=file content:blob=%4 perms=644", args);
+                        
+                        Array<Clause> writeCols;
+                        Clause c1; c1.col = "name"; c1.op = "="; c1.val = fileName; writeCols.push(c1);
+                        Clause c2; c2.col = "parent_id"; c2.op = "="; c2.val = currentParentId; writeCols.push(c2);
+                        Clause c3; c3.col = "id"; c3.op = "="; c3.val = fileId; writeCols.push(c3);
+                        Clause c4; c4.col = "type"; c4.op = "="; c4.val = "file"; writeCols.push(c4);
+                        Clause c5; c5.col = colName; c5.op = "="; c5.val = content; writeCols.push(c5);
+                        Clause c6; c6.col = "perms"; c6.op = "="; c6.val = "644"; writeCols.push(c6);
+                        
+                        xm.write(writeCols, Array<Clauses>(), txId);
+                    }
+                    
+                    txCount++;
+                    if (txCount >= 200) {
+                        xm.unlock(txId);
+                        txId = xm.lock();
+                        txCount = 0;
                     }
                     
                     printf("IO: Wrote %llu bytes to %s\n", (unsigned long long)size, dstPath.data());
@@ -600,6 +517,7 @@ int main(int argc, char** argv) {
                 printf("Error: %s does not exist or is not a regular file/directory.\n", linuxPath.data());
             }
 
+            if (txCount > 0) xm.unlock(txId);
             xm.flush();
             continue;
         }
@@ -615,9 +533,20 @@ int main(int argc, char** argv) {
             String q = "GR EXTRACT \"" + xylemPath + "\"";
             QueryResult res = xm.query(q);
             if (res.treeResult && res.treeResult->size() > 0) {
-                RowNode* rn = dynamic_cast<RowNode*>((*res.treeResult)[0]);
-                if (rn && rn->row.has("content")) {
-                    String content = *rn->row.get("content");
+                RowNode* rn = getDeepestRowNode((*res.treeResult)[0]);
+                String content;
+                bool foundContent = false;
+                if (rn) {
+                    if (rn->row.has("content")) {
+                        content = *rn->row.get("content");
+                        foundContent = true;
+                    } else if (rn->row.has("content:blob")) {
+                        content = xm.getBlob(rn->row.get("content:blob")->toInt());
+                        foundContent = true;
+                    }
+                }
+                
+                if (foundContent) {
                     std::ofstream file((const char*)linuxPath.data(), std::ios::binary);
                     if (file.is_open()) {
                         file.write((const char*)content.data(), content.size());
@@ -638,12 +567,12 @@ int main(int argc, char** argv) {
         // Pass any other command directly to the Query Parser
         QueryResult res = xm.query(line);
         printResult(res);
-        if (cmd == "WRITE" || cmd == "WRITEVOLATILE" || cmd == "REMOVE") {
-            xm.flush();
+        if (cmd == "WRITE" || cmd == "WRITEVOLATILE" || cmd == "REMOVE" || cmd == "TEE" || cmd == "UNLINK") {
+            // xm.flush() is now done internally instantly by XylemEngine.
         }
     }
 
-    xm.unmount();
+    xm.destroy();
     printf("Goodbye.\n");
     return 0;
 }

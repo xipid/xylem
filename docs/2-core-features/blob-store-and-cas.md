@@ -29,7 +29,12 @@ assert(hash1 == hash2); // Guaranteed to match
 ## Transparent Blob Columns
 Xylem supports a special column type modifier: `:blob`. When a column is configured as `:blob`, Xylem automatically hashes the payload, writes the content to the Blob Store, and stores the 16-byte reference hash inside the table.
 
-When querying, Xylem resolves the hash and serves the raw content transparently:
+### Automatic Small Blob Inlining (< 512 bytes)
+Xylem applies heavy optimization on `:blob` column payloads based on payload size:
+- **Payloads >= 512 bytes**: Are fully hashed using BLAKE2b and written out to independent Content-Addressable physical blocks to guarantee deduplication and save massive space. The row node stores only the 16-byte hash.
+- **Payloads < 512 bytes**: Are deemed too small to warrant an entire 4KB block overhead in the Blob Store. Instead, Xylem intelligently skips the CAS system entirely and structurally **inlines the text/binary value directly into the B+ Tree row node**. This vastly improves I/O performance and space efficiency for tiny configuration blobs, small textual keys, and micro-assets.
+
+When querying, Xylem seamlessly resolves either mechanism entirely transparently:
 
 ```cpp
 String massiveText = "A very long document...";
@@ -40,7 +45,7 @@ xm.write({
     {"content:blob", "=", massiveText}
 });
 
-// Reading the column automatically fetches the content from the Blob Store
+// Reading the column automatically fetches the content from the Blob Store (or from the inline tree directly if < 512 bytes)
 auto result = xm.read({"content"}, {WHERE("doc_id", "=", "file_01")});
 String retrieved = result[0]["content"]; // Returns "A very long document..."
 ```

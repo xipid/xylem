@@ -36,6 +36,14 @@ struct BlobMeta {
     u32 length;         // Total payload length (after compression / encryption)
     u32 originalSize;   // Original unencrypted, uncompressed size
     u64 fixedPosition;  // Byte address if pinned (0 = not fixed)
+    u32 ref;            // Reference handle (1-based, 0 = unassigned)
+    bool frozen;        // Whether this blob is frozen at fixedPosition
+    bool used;          // Whether this blob is actively referenced by items
+};
+
+struct PendingFreeze {
+    u64 position;       // Byte address to freeze at
+    u32 ref;            // Blob ref to freeze
 };
 
 class BlobStore {
@@ -45,6 +53,14 @@ public:
 
     // Key → blob location index
     Map<String, BlobMeta> index;
+
+    // Ref-based mapping
+    Map<u32, String> refToHash;      // ref → hash
+    Map<String, u32> hashToRef;      // hash → ref
+    u32 nextRef = 1;
+
+    // Pending freezes (for blobs not yet written) — persisted to block device
+    Array<PendingFreeze> pendingFreezes;
 
 #ifdef XI_ZSTD_ENABLED
     LLT::ZSTD zstd;
@@ -66,8 +82,57 @@ public:
 
     BlobStore(BlockDevice* dev, Allocator* alloc, Array<String>* keys = nullptr);
 
-    // Returns original size as string if exists, empty otherwise
-    String statHash(const String& hash);
+    // ─── Ref-based public API ────────────────────────────────────────────────
+
+    // Get ref for a hash. Returns 0 if not found.
+    u32 getBlobRef(const String& hash);
+
+    // Read full blob content by ref
+    String getBlob(u32 ref);
+
+    // Get blob original size by ref
+    u32 getBlobSize(u32 ref);
+
+    // Write content to a blob by ref (partial write with start offset)
+    void writeBlob(u32 ref, const String& content, u64 start = 0);
+
+    // Read blob content by ref (partial read, end=0 means to end)
+    String readBlob(u32 ref, u64 start = 0, u64 end = 0);
+
+    // Set the hash of a blob ref externally (user-provided hash)
+    void setBlob(u32 ref, const String& hash);
+
+    // Auto-hash a blob's content, write the hash. Returns the computed hash.
+    String setBlob(u32 ref);
+
+    // Freeze a blob at a byte position. Works even if blob not yet written (deferred).
+    bool freezeBlob(u64 position, u32 blobRef);
+
+    // Thaw a blob — allow Xylem to relocate it. Does NOT remove the blob.
+    void thawBlob(u32 blobRef);
+
+    // Set blob usage explicitly
+    void setBlobUsed(u32 ref, bool used);
+
+    // Allocate a ref for a hash (internal)
+    u32 allocRef(const String& hash);
+
+    // Resolve any pending freezes (called after writeBlob)
+    void resolvePendingFreezes();
+
+    // Persist pending freezes to block device (power-loss safe)
+    void savePendingFreezes();
+
+    // Load pending freezes from block device on mount
+    void loadPendingFreezes();
+
+    // Persist refs mapping and usage status
+    void saveRefsAndUsage();
+    
+    // Load refs mapping and usage status on mount
+    void loadRefsAndUsage();
+
+    // ─── Internal hash-based API (used by engine internals) ──────────────────
 
     // Reads content; respects [minOffset, maxOffset) range (0,0 = all)
     String readHash(const String& hash, u64 minOffset = 0, u64 maxOffset = 0);

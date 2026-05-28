@@ -1,4 +1,5 @@
 #include <Xylem/Journal.hpp>
+#include <Xylem/TableStore.hpp>
 
 namespace Xylem {
 
@@ -71,7 +72,7 @@ void Journal::writeToFlash(const Array<JournalEntry>& entries) {
     }
 }
 
-void Journal::recover() {
+void Journal::recover(TableStore* ts) {
     if (!device || !device->config.onDeviceRead) return;
 
     u32 blockSize = device->config.blockSize;
@@ -114,6 +115,10 @@ void Journal::recover() {
             } else if (opType == JournalOpType::LOCK_ROLLBACK && pLen >= 8) {
                 u64 lockId = *(u64*)ptr;
                 rolledBack.set(lockId, true);
+            } else if (opType == JournalOpType::TABLE_WRITE || 
+                       opType == JournalOpType::TABLE_REMOVE || 
+                       opType == JournalOpType::ROW_WRITE) {
+                if (ts) deserializeAndApply(ts, opType, String((const u8*)ptr, pLen));
             }
             ptr += pLen;
         }
@@ -220,6 +225,156 @@ u64 Journal::oldestActiveSnapshot() const {
         if (it->value.snapshotSeq < oldest) oldest = it->value.snapshotSeq;
     }
     return oldest;
+}
+
+static void writeU64(String& buf, u64 v) {
+    usz old = buf.size();
+    buf.allocate(old + 8);
+    *(u64*)(buf.data() + old) = v;
+}
+
+static u64 readU64(const u8*& ptr) {
+    u64 v = *(u64*)ptr; ptr += 8;
+    return v;
+}
+
+static void writeStr(String& buf, const String& s) {
+    writeU64(buf, s.size());
+    if (s.size() > 0) {
+        usz old = buf.size();
+        buf.allocate(old + s.size());
+        for (usz i = 0; i < s.size(); ++i) buf[old + i] = s[i];
+    }
+}
+
+static String readStr(const u8*& ptr) {
+    u64 len = readU64(ptr);
+    if (len == 0) return String();
+    String s; s.allocate(len);
+    for (u64 i = 0; i < len; ++i) s[i] = *ptr++;
+    return s;
+}
+
+static void writeClauses(String& buf, const Clauses& c) {
+    usz old = buf.size();
+    buf.allocate(old + 1);
+    buf[old] = c.isAssert ? 1 : 0;
+    writeU64(buf, c.size());
+    for (usz i = 0; i < c.size(); ++i) {
+        writeStr(buf, c[i].col);
+        writeStr(buf, c[i].op);
+        writeStr(buf, c[i].val);
+    }
+}
+
+static Clauses readClauses(const u8*& ptr) {
+    Clauses c;
+    c.isAssert = *ptr++ != 0;
+    u64 len = readU64(ptr);
+    for (u64 i = 0; i < len; ++i) {
+        Clause cl;
+        cl.col = readStr(ptr);
+        cl.op = readStr(ptr);
+        cl.val = readStr(ptr);
+        c.push(cl);
+    }
+    return c;
+}
+
+String Journal::serializeTableWrite(const Array<Clause>& columns, const Array<Clauses>& clauses, const String& encryptionKey) {
+    String buf;
+    writeU64(buf, columns.size());
+    for (usz i = 0; i < columns.size(); ++i) {
+        writeStr(buf, columns[i].col);
+        writeStr(buf, columns[i].val);
+    }
+    writeU64(buf, clauses.size());
+    for (usz i = 0; i < clauses.size(); ++i) writeClauses(buf, clauses[i]);
+    writeStr(buf, encryptionKey);
+    return buf;
+}
+
+String Journal::serializeTableRemove(const Array<Clauses>& clauses, u64 length) {
+    String buf;
+    writeU64(buf, length);
+    writeU64(buf, clauses.size());
+    for (usz i = 0; i < clauses.size(); ++i) writeClauses(buf, clauses[i]);
+    return buf;
+}
+
+static void writeGraphOp(String& buf, const GraphOp& op) {
+    usz old = buf.size();
+    buf.allocate(old + 1);
+    buf[old] = (u8)op.type;
+    writeU64(buf, op.query.size());
+    for (usz i = 0; i < op.query.size(); ++i) writeClauses(buf, op.query[i]);
+    writeU64(buf, op.untilQuery.size());
+    for (usz i = 0; i < op.untilQuery.size(); ++i) writeClauses(buf, op.untilQuery[i]);
+    writeU64(buf, op.writeSet.size());
+    for (usz i = 0; i < op.writeSet.size(); ++i) {
+        writeStr(buf, op.writeSet[i].col);
+        writeStr(buf, op.writeSet[i].op);
+        writeStr(buf, op.writeSet[i].val);
+    }
+}
+
+static GraphOp readGraphOp(const u8*& ptr) {
+    GraphOp op;
+    op.type = (GraphOpType)*ptr++;
+    u64 qLen = readU64(ptr);
+    for (u64 i = 0; i < qLen; ++i) op.query.push(readClauses(ptr));
+    u64 uqLen = readU64(ptr);
+    for (u64 i = 0; i < uqLen; ++i) op.untilQuery.push(readClauses(ptr));
+    u64 wLen = readU64(ptr);
+    for (u64 i = 0; i < wLen; ++i) {
+        Clause cl;
+        cl.col = readStr(ptr);
+        cl.op = readStr(ptr);
+        cl.val = readStr(ptr);
+        op.writeSet.push(cl);
+    }
+    return op;
+}
+
+String Journal::serializeGraphWrite(const Array<GraphOp>& ops, const String& encryptionKey) {
+    String buf;
+    writeU64(buf, ops.size());
+    for (usz i = 0; i < ops.size(); ++i) writeGraphOp(buf, ops[i]);
+    writeStr(buf, encryptionKey);
+    return buf;
+}
+
+void Journal::deserializeAndApply(TableStore* ts, JournalOpType type, const String& payload) {
+    if (!ts || payload.isEmpty()) return;
+    const u8* ptr = (const u8*)payload.data();
+    
+    if (type == JournalOpType::TABLE_WRITE) {
+        u64 colLen = readU64(ptr);
+        Array<Clause> columns;
+        for (u64 i = 0; i < colLen; ++i) {
+            Clause c; c.col = readStr(ptr); c.op = "="; c.val = readStr(ptr);
+            columns.push(c);
+        }
+        u64 clLen = readU64(ptr);
+        Array<Clauses> clauses;
+        for (u64 i = 0; i < clLen; ++i) clauses.push(readClauses(ptr));
+        String key = readStr(ptr);
+        ts->write(columns, clauses, key);
+    } 
+    else if (type == JournalOpType::TABLE_REMOVE) {
+        u64 length = readU64(ptr);
+        u64 clLen = readU64(ptr);
+        Array<Clauses> clauses;
+        for (u64 i = 0; i < clLen; ++i) clauses.push(readClauses(ptr));
+        ts->remove(clauses, length);
+    }
+    else if (type == JournalOpType::ROW_WRITE) { 
+        u64 opsLen = readU64(ptr);
+        Array<GraphOp> ops;
+        for (u64 i = 0; i < opsLen; ++i) ops.push(readGraphOp(ptr));
+        String key = readStr(ptr);
+        ts->graphWrite(ops, key);
+    }
 }
 
 } // namespace Xylem

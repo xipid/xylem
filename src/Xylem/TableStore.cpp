@@ -271,6 +271,10 @@ void TableStore::incrementBlobRef(const String& hash) {
         (*blobRefCounts.get(hash))++;
     } else {
         blobRefCounts.set(hash, 1);
+        if (blobStore) {
+            auto ref = blobStore->getBlobRef(hash);
+            blobStore->setBlobUsed(ref, true);
+        }
     }
 }
 
@@ -280,7 +284,8 @@ void TableStore::decrementBlobRef(const String& hash) {
     if (count <= 1) {
         blobRefCounts.remove(hash);
         if (blobStore && !blobStore->isFixed(hash)) {
-            blobStore->removeHash(hash);
+            auto ref = blobStore->getBlobRef(hash);
+            blobStore->setBlobUsed(ref, false);
         }
     } else {
         count--;
@@ -750,6 +755,21 @@ int TableStore::write(const Array<Clause>& columns, const Array<Clauses>& clause
     if (clauses.size() == 0) {
         // ─── Insert ─────────────────────────────────────────────────────────
         
+        // Prevent duplicates from journal replay by checking if row with this explicit id already exists
+        String explicitId;
+        for (const auto& c : columns) {
+            ParsedCol pc = parseCol(c.col);
+            if (pc.name == "id") { explicitId = c.val; break; }
+        }
+        if (!explicitId.isEmpty()) {
+            Array<String> idCols; idCols.push("id");
+            Array<Clauses> checkWhere; checkWhere.push(WHERE("id", "=", explicitId));
+            // Bypass MVCC snapshot for this check to guarantee uniqueness globally
+            if (read(idCols, checkWhere, 0, false, 0, 0).size() > 0) {
+                return 0; // Already exists, drop this insert (likely from journal replay)
+            }
+        }
+
         // Check for virtual columns
         bool hasVirtual = false;
         Map<String, String> virtualRow; // For watcher notification

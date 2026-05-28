@@ -143,7 +143,27 @@ AllocHeapEntry Allocator::popHeap() {
 
 u32 Allocator::allocBlock(BlockType type) {
     while (true) {
-        if (freeHeap.size() == 0) return 0;
+        if (freeHeap.size() == 0) {
+            if (device->config.deviceExpands) {
+                u32 oldSize = bam.size();
+                u32 newSize = oldSize + 1024;
+                u32 entriesPerBlock = device->config.blockSize / sizeof(BlockMeta);
+                if (newSize > bamBlockCount * entriesPerBlock) {
+                    return 0; // BAM capacity reached, cannot expand further seamlessly
+                }
+                device->config.deviceSize = newSize * (u64)device->config.blockSize;
+                bam.allocate(newSize);
+                for (u32 i = oldSize; i < newSize; ++i) {
+                    bam[i].setStatus(BlockStatus::FREE);
+                    bam[i].setType(BlockType::FREE);
+                    bam[i].eraseCount = 0;
+                    AllocHeapEntry e; e.blockIdx = i; e.eraseCount = 0;
+                    pushHeap(e);
+                }
+                continue;
+            }
+            return 0;
+        }
         
         AllocHeapEntry entry = popHeap();
         

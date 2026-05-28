@@ -134,11 +134,12 @@ int main() {
         xm.writeHash(largePayload); // Write it 100 times (CAS dedup)
     }
     
-    String stat = xm.statHash(h1);
-    if (stat == "51200") Success("Test 6 Passed: 100 duplicated 50KB blobs safely resolved to 1 physical block.");
-    else Error("Test 6 Failed: CAS Deduplication failed. Stat=" + stat + " Block=" + String::from((u64)xm.blobStore->index.size()));
+    u32 blobRef = xm.getBlobRef(h1);
+    u32 blobSz = xm.getBlobSize(blobRef);
+    if (blobSz == 51200) Success("Test 6 Passed: 100 duplicated 50KB blobs safely resolved to 1 physical block.");
+    else Error("Test 6 Failed: CAS Deduplication failed. Size=" + String::from((u64)blobSz) + " Block=" + String::from((u64)xm.blobStore->index.size()));
 
-    xm.unmount();
+    xm.destroy();
     Success("=== ALL ANGRY DEV TESTS PASSED ===");
     return 0;
 }
