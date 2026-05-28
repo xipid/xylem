@@ -8,7 +8,7 @@ Xylem is a revolutionary **multi-model embedded database** engine built from the
 *   **Content-Addressable Blob Storage** (Alternative to custom file containers)
 *   **Raw Flash Wear-Leveling Layer** (Alternative to littlefs/SPIFFS)
 
-By packing all these components into a single file format (`.xlm`), Xylem provides a unified and highly robust data container.
+By packing all these components into a single format, Xylem provides a unified and highly robust data container.
 
 ## Why Xylem?
 

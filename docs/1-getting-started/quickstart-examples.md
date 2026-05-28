@@ -19,7 +19,7 @@ int main() {
     xm.maxCache = 1024 * 1024 * 2;           // 2MB Cache
 
     // Open file descriptor
-    int fd = open("my_database.xlm", O_RDWR | O_CREAT, 0644);
+    int fd = open("my_database.xy", O_RDWR | O_CREAT, 0644);
 
     // Bind low-level storage callbacks
     xm.config.onDeviceRead = [fd](u64 offset, u64 maxOffset) -> String {

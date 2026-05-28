@@ -9,7 +9,7 @@
 
 Xylem is a lightweight, zero-dependency, serverless database engine written in C++17. Designed to run on everything from constrained microcontrollers (like ESP32 using raw SPI flash) to full-scale Linux application backends, Xylem collapses the boundary between different storage paradigms. 
 
-Instead of combining **SQLite** (relational), **littlefs** (raw block/wear-leveling storage), **FAISS** (vector similarity), and **tar/zip** (file packaging), you can use Xylem to manage it all in one cohesive, transactional file format (`.xlm`).
+Instead of combining **SQLite** (relational), **littlefs** (raw block/wear-leveling storage), **FAISS** (vector similarity), and **tar/zip** (file packaging), you can use Xylem to manage it all in one cohesive format.
 
 ---
 
