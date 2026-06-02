@@ -13,6 +13,13 @@ namespace Xylem {
 TableStore::TableStore(BlockDevice* dev, Allocator* alloc, Array<String>* keys) 
     : device(dev), allocator(alloc), globalKeys(keys) {}
 
+TableStore::~TableStore() {
+    for (auto it = colBloomFilters.begin(); it != colBloomFilters.end(); ++it) {
+        delete it->value;
+    }
+    colBloomFilters.clear();
+}
+
 usz approxRowBytes(const Map<String, String>& row) {
     usz b = 64;
     for(auto it = row.begin(); it != row.end(); ++it) {
@@ -396,7 +403,7 @@ bool TableStore::isVisibleToSnapshot(u64 rowId, u64 snapshotSeq, u64 txId) {
 bool TableStore::hasConflicts(const Array<u64>& touchedIds, u64 snapshotSeq) {
     for (usz i = 0; i < touchedIds.size(); ++i) {
         auto* modSeq = rowModSeq.get(touchedIds[i]);
-        if (modSeq && *modSeq > snapshotSeq) return true;
+        if (modSeq && *modSeq >= snapshotSeq) return true;
     }
     return false;
 }
@@ -432,7 +439,18 @@ void TableStore::gcVersions(u64 oldestActiveSnapshot) {
 
 // ─── Clause Evaluation ─────────────────────────────────────────────────────
 
-f32 TableStore::evaluateClause(const Map<String, String>& row, const Clause& clause, const Map<String, String>* parentRow) {
+f32 TableStore::evaluateClause(const Map<String, String>& row, const Clause& clause, const Map<String, String>* parentRow, u64 rId) {
+    if (clause.op == "path") {
+        String key = clause.col + "::" + clause.val;
+        auto* ids = precomputedPaths.get(key);
+        if (ids) {
+            for (usz i = 0; i < ids->size(); ++i) {
+                if ((*ids)[i] == rId) return 1.0f;
+            }
+        }
+        return -1.0f;
+    }
+
     if (!row.has(clause.col)) return -1.0f;
     String val = *row.get(clause.col);
     
@@ -513,14 +531,14 @@ f32 TableStore::evaluateClause(const Map<String, String>& row, const Clause& cla
     return -1.0f;
 }
 
-f32 TableStore::evaluateClauses(const Map<String, String>& row, const Array<Clauses>& clausesGroups, const Map<String, String>* parentRow) {
+f32 TableStore::evaluateClauses(const Map<String, String>& row, const Array<Clauses>& clausesGroups, const Map<String, String>* parentRow, u64 rId) {
     if (clausesGroups.size() == 0) return 1.0f;
     f32 maxScore = -1.0f;
     for (const auto& group : clausesGroups) {
         f32 groupMinScore = 1.0f;
         bool groupMatch = true;
         for (const auto& clause : group) {
-            f32 s = evaluateClause(row, clause, parentRow);
+            f32 s = evaluateClause(row, clause, parentRow, rId);
             if (s < 0.0f) {
                 groupMatch = false;
                 break;
@@ -541,6 +559,32 @@ Array<Map<String, String>> TableStore::read(const Array<String>& columns, const 
                                              u64 snapshotSeq, u64 txId) {
     Array<Map<String, String>> result;
 
+    if (colBloomFiltersDirty) rebuildBloomFilters();
+
+    bool allFilteredOut = true;
+    if (clauses.size() > 0) {
+        for (const auto& group : clauses) {
+            bool groupPossible = true;
+            for (const auto& clause : group) {
+                if (clause.op == "=") {
+                    if (colBloomFilters.has(clause.col) && !(*colBloomFilters.get(clause.col))->contains(clause.val)) {
+                        groupPossible = false;
+                        break;
+                    }
+                }
+            }
+            if (groupPossible) {
+                allFilteredOut = false;
+                break;
+            }
+        }
+    } else {
+        allFilteredOut = false;
+    }
+    if (allFilteredOut) return {};
+
+    resolvePathsInClauses(clauses, snapshotSeq, txId);
+
     for (usz gi = 0; gi < clauses.size(); ++gi) {
         const auto& group = clauses[gi];
         if (group.isAssert) {
@@ -549,7 +593,7 @@ Array<Map<String, String>> TableStore::read(const Array<String>& columns, const 
                 Map<String, String>* row = fetchRow(rId);
                 if (!row) continue;
                 Array<Clauses> temp; temp.push(group);
-                if (evaluateClauses(*row, temp) >= 0.0f) {
+                if (evaluateClauses(*row, temp, nullptr, rId) >= 0.0f) {
                     return result; 
                 }
             }
@@ -599,10 +643,8 @@ Array<Map<String, String>> TableStore::read(const Array<String>& columns, const 
     };
 
     const Clause* cosClause = nullptr;
-    for (const auto& group : clauses) {
-        for (const auto& clause : group) {
-            if (clause.op == "cos") cosClause = &clause;
-        }
+    if (clauses.size() > 0 && clauses[0].size() > 0 && clauses[0][0].op == "cos") {
+        cosClause = &clauses[0][0];
     }
 
     if (cosClause && hnsw) {
@@ -640,7 +682,7 @@ Array<Map<String, String>> TableStore::read(const Array<String>& columns, const 
             Map<String, String>* row = fetchRow(rId);
             if (!row) continue;
             
-            if (evaluateClauses(*row, clauses) >= 0.0f) {
+            if (evaluateClauses(*row, clauses, nullptr, rId) >= 0.0f) {
                 result.push(applySelect(*row));
                 count++;
                 if (length > 0 && count >= length) break;
@@ -696,7 +738,7 @@ Array<Map<String, String>> TableStore::read(const Array<String>& columns, const 
                     if (!isVisibleToSnapshot(rId, snapshotSeq, txId)) continue;
                     Map<String, String>* row = fetchRow(rId);
                     if (!row) continue;
-                    f32 score = evaluateClauses(*row, clauses);
+                    f32 score = evaluateClauses(*row, clauses, nullptr, rId);
                     if (score >= 0.0f) {
                         ScoredRow sr; sr.score = score; sr.row = applySelect(*row);
                         matches.push(sr);
@@ -712,7 +754,7 @@ Array<Map<String, String>> TableStore::read(const Array<String>& columns, const 
             if (!isVisibleToSnapshot(rId, snapshotSeq, txId)) continue;
             Map<String, String>* row = fetchRow(rId);
             if (!row) continue;
-            f32 score = evaluateClauses(*row, clauses);
+            f32 score = evaluateClauses(*row, clauses, nullptr, rId);
             if (score >= 0.0f) {
                 ScoredRow sr;
                 sr.score = score;
@@ -744,6 +786,8 @@ int TableStore::write(const Array<Clause>& columns, const Array<Clauses>& clause
                       const String& encryptionKey, u64 txId, bool isVolatile) {
     u16 tId = findOrCreateTable(columns);
     
+    resolvePathsInClauses(clauses, currentSeq, txId);
+    
     // Check ASSERT clauses
     for (usz gi = 0; gi < clauses.size(); ++gi) {
         const auto& group = clauses[gi];
@@ -752,7 +796,7 @@ int TableStore::write(const Array<Clause>& columns, const Array<Clauses>& clause
                 Map<String, String>* row = fetchRow(rId);
                 if (!row) continue;
                 Array<Clauses> temp; temp.push(group);
-                if (evaluateClauses(*row, temp) >= 0.0f) {
+                if (evaluateClauses(*row, temp, nullptr, rId) >= 0.0f) {
                     return (int)(gi + 1); // 1-based ASSERT clause index
                 }
             }
@@ -862,7 +906,7 @@ int TableStore::write(const Array<Clause>& columns, const Array<Clauses>& clause
                 colHashIndex.get(it->key)->operator[](val).push(rId);
             }
         }
-        
+        colBloomFiltersDirty = true;
         return 0;
     }
     
@@ -910,7 +954,7 @@ int TableStore::write(const Array<Clause>& columns, const Array<Clauses>& clause
     auto doUpdateRow = [&](u64 rId) {
         Map<String, String>* row = fetchRow(rId);
         if (!row) return;
-        if (evaluateClauses(*row, clauses) >= 0.0f) {
+        if (evaluateClauses(*row, clauses, nullptr, rId) >= 0.0f) {
             String keyToUse = encryptionKey;
             if (keyToUse.isEmpty() && globalKeys) {
                 for (const auto& existingCol : columns) {
@@ -969,7 +1013,7 @@ int TableStore::write(const Array<Clause>& columns, const Array<Clauses>& clause
                         }
                     }
                     String hash = Sec::hash(content, 16);
-                    blobStore->writeHash(hash, 0, content, keyToUse);
+                    blobStore->writeHash(hash, 0, content, keyToUse, oldBlobHashToDecrement, currentSeq);
                     incrementBlobRef(hash);
                     String ref = makeBlobRef(hash);
                     row->set(pc.name, keyToUse.isEmpty() ? ref : CryptItem::encrypt(ref, keyToUse));
@@ -1022,6 +1066,7 @@ int TableStore::write(const Array<Clause>& columns, const Array<Clauses>& clause
             doUpdateRow(rId);
         }
     }
+    colBloomFiltersDirty = true;
     evictIfNeeded();
     return 0;
 }
@@ -1029,6 +1074,8 @@ int TableStore::write(const Array<Clause>& columns, const Array<Clauses>& clause
 // ─── Remove ─────────────────────────────────────────────────────────────────
 
 bool TableStore::remove(const Array<Clauses>& clauses, u64 length) {
+    resolvePathsInClauses(clauses, currentSeq, 0);
+
     Array<u64> toRemove;
     Array<u64> candidateIds;
     bool fastPathUsed = false;
@@ -1074,7 +1121,7 @@ bool TableStore::remove(const Array<Clauses>& clauses, u64 length) {
         for (u64 rId : candidateIds) {
             Map<String, String>* row = fetchRow(rId);
             if (!row) continue;
-            if (evaluateClauses(*row, clauses) >= 0.0f) {
+            if (evaluateClauses(*row, clauses, nullptr, rId) >= 0.0f) {
                 toRemove.push(rId);
             }
         }
@@ -1082,7 +1129,7 @@ bool TableStore::remove(const Array<Clauses>& clauses, u64 length) {
         for (u64 rId : allRowIds) {
             Map<String, String>* row = fetchRow(rId);
             if (!row) continue;
-            if (evaluateClauses(*row, clauses) >= 0.0f) {
+            if (evaluateClauses(*row, clauses, nullptr, rId) >= 0.0f) {
                 toRemove.push(rId);
             }
         }
@@ -1148,432 +1195,10 @@ bool TableStore::remove(const Array<Clauses>& clauses, u64 length) {
         rowModSeq.remove(rId);
         volatileRows.remove(rId);
     }
+    colBloomFiltersDirty = true;
     return true;
 }
 
-// ─── Graph Read ─────────────────────────────────────────────────────────────
-
-Collection::TreeBranch* TableStore::graphRead(const Array<String>& columns, const Array<GraphOp>& ops,
-                                               u64 limit, u64 snapshotSeq, u64 txId) {
-    Collection::TreeBranch* root = new Collection::TreeBranch();
-    root->setName("Root");
-    
-    Array<RowNode*> activeNodes;
-    
-    auto applySelect = [&](const Map<String, String>& row) -> Map<String, String> {
-        Map<String, String> outRow;
-        if (columns.size() == 0) {
-            for (auto it = row.begin(); it != row.end(); ++it) {
-                String val = globalKeys ? CryptItem::decrypt(it->value, *globalKeys) : it->value;
-                if (isBlobRef(val) && blobStore) {
-                    String hash = extractBlobHash(val);
-                    String content = blobStore->readHash(hash, 0, 0xFFFFFFFF);
-                    if (!content.isEmpty()) val = content;
-                }
-                outRow.set(it->key, val);
-            }
-        } else {
-            for (const auto& colName : columns) {
-                ParsedCol pc = parseCol(colName);
-                if (!row.has(pc.name)) continue;
-                String v = *row.get(pc.name);
-                if (globalKeys) v = CryptItem::decrypt(v, *globalKeys);
-                if (isBlobRef(v) && blobStore) {
-                    String hash = extractBlobHash(v);
-                    String content = blobStore->readHash(hash, 0, 0xFFFFFFFF);
-                    if (!content.isEmpty()) v = content;
-                }
-                outRow.set(pc.name, v);
-            }
-        }
-        return outRow;
-    };
-    
-    for (usz opIdx = 0; opIdx < ops.size(); ++opIdx) {
-        const GraphOp& op = ops[opIdx];
-        
-        if (op.type == GraphOpType::MATCH) {
-            for (u64 rId : allRowIds) {
-                if (!isVisibleToSnapshot(rId, snapshotSeq, txId)) continue;
-                Map<String, String>* row = fetchRow(rId);
-                if (!row) continue;
-                if (evaluateClauses(*row, op.query) >= 0.0f) {
-                    RowNode* n = new RowNode(rId, applySelect(*row));
-                    activeNodes.push(n);
-                    root->add(n);
-                }
-            }
-        } else if (op.type == GraphOpType::FOLLOW) {
-            Array<RowNode*> nextActive;
-            bool fastPath = false;
-            long long fastClauseIdx = -1;
-            if (op.query.size() == 1) {
-                for (usz ci = 0; ci < op.query[0].size(); ++ci) {
-                    if (op.query[0][ci].op == "=" && op.query[0][ci].val.startsWith("parent.")) {
-                        fastPath = true;
-                        fastClauseIdx = (long long)ci;
-                        break;
-                    }
-                }
-            }
-            
-            if (fastPath && !disableIndex) {
-                if (colHashIndexDirty) rebuildColHashIndex();
-                String targetCol = op.query[0][fastClauseIdx].col;
-                String parentKey = op.query[0][fastClauseIdx].val.substring(7);
-                
-                auto* valMap = colHashIndex.get(targetCol);
-                
-                for (RowNode* node : activeNodes) {
-                    if (!node->row.has(parentKey)) continue;
-                    String targetVal = *node->row.get(parentKey);
-                    
-                    if (valMap) {
-                        auto* rowIds = valMap->get(targetVal);
-                        if (rowIds) {
-                            for (u64 rId : *rowIds) {
-                                if (!isVisibleToSnapshot(rId, snapshotSeq, txId)) continue;
-                                Map<String, String>* row = fetchRow(rId);
-                                if (!row) continue;
-                                if (evaluateClauses(*row, op.query, &node->row) >= 0.0f) {
-                                    RowNode* child = new RowNode(rId, applySelect(*row));
-                                    node->add(child);
-                                    nextActive.push(child);
-                                }
-                            }
-                        }
-                    }
-                }
-            } else {
-                for (RowNode* node : activeNodes) {
-                    for (u64 rId : allRowIds) {
-                        if (!isVisibleToSnapshot(rId, snapshotSeq, txId)) continue;
-                        Map<String, String>* row = fetchRow(rId);
-                        if (!row) continue;
-                        if (evaluateClauses(*row, op.query, &node->row) >= 0.0f) {
-                            RowNode* child = new RowNode(rId, applySelect(*row));
-                            node->add(child);
-                            nextActive.push(child);
-                        }
-                    }
-                }
-            }
-            activeNodes = nextActive;
-        } else if (op.type == GraphOpType::UNTIL) {
-            Array<RowNode*> nextActive;
-            for (RowNode* node : activeNodes) {
-                if (evaluateClauses(node->row, op.query) < 0.0f) {
-                    nextActive.push(node);
-                }
-            }
-            activeNodes = nextActive;
-        } else if (op.type == GraphOpType::REPEATFOLLOW) {
-            Array<RowNode*> currentLevel = activeNodes;
-            Array<RowNode*> allFound;
-            Map<u64, bool> visited;
-            for (RowNode* n : currentLevel) visited.set(n->rId, true);
-            
-            bool fastPath = false;
-            long long fastClauseIdx = -1;
-            if (op.query.size() == 1) {
-                for (usz ci = 0; ci < op.query[0].size(); ++ci) {
-                    if (op.query[0][ci].op == "=" && op.query[0][ci].val.startsWith("parent.")) {
-                        fastPath = true;
-                        fastClauseIdx = (long long)ci;
-                        break;
-                    }
-                }
-            }
-            
-            while (currentLevel.size() > 0) {
-                Array<RowNode*> nextLevel;
-                if (fastPath && !disableIndex) {
-                    if (colHashIndexDirty) rebuildColHashIndex();
-                    String targetCol = op.query[0][fastClauseIdx].col;
-                    String parentKey = op.query[0][fastClauseIdx].val.substring(7);
-                    auto* valMap = colHashIndex.get(targetCol);
-                    
-                    for (RowNode* node : currentLevel) {
-                        if (op.untilQuery.size() > 0 && evaluateClauses(node->row, op.untilQuery) >= 0.0f) continue;
-                        if (!node->row.has(parentKey)) continue;
-                        String targetVal = *node->row.get(parentKey);
-                        if (valMap) {
-                            auto* rowIds = valMap->get(targetVal);
-                            if (rowIds) {
-                                for (u64 rId : *rowIds) {
-                                    if (visited.has(rId)) continue;
-                                    if (!isVisibleToSnapshot(rId, snapshotSeq, txId)) continue;
-                                    Map<String, String>* row = fetchRow(rId);
-                                    if (!row) continue;
-                                    if (evaluateClauses(*row, op.query, &node->row) >= 0.0f) {
-                                        RowNode* child = new RowNode(rId, applySelect(*row));
-                                        node->add(child);
-                                        nextLevel.push(child);
-                                        allFound.push(child);
-                                        visited.set(rId, true);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    for (RowNode* node : currentLevel) {
-                        if (op.untilQuery.size() > 0 && evaluateClauses(node->row, op.untilQuery) >= 0.0f) {
-                            continue;
-                        }
-                        for (u64 rId : allRowIds) {
-                            if (visited.has(rId)) continue;
-                            if (!isVisibleToSnapshot(rId, snapshotSeq, txId)) continue;
-                            Map<String, String>* row = fetchRow(rId);
-                            if (!row) continue;
-                            if (evaluateClauses(*row, op.query, &node->row) >= 0.0f) {
-                                RowNode* child = new RowNode(rId, applySelect(*row));
-                                node->add(child);
-                                nextLevel.push(child);
-                                allFound.push(child);
-                                visited.set(rId, true);
-                            }
-                        }
-                    }
-                }
-                currentLevel = nextLevel;
-            }
-            activeNodes = allFound;
-        }
-    }
-    
-    if (limit > 0 && activeNodes.size() > limit) {
-        for (usz i = limit; i < activeNodes.size(); ++i) {
-            RowNode* extra = activeNodes[i];
-            if (extra->parent) {
-                if (Collection::TreeBranch* p = dynamic_cast<Collection::TreeBranch*>(extra->parent)) {
-                    p->removeChild(extra);
-                }
-                delete extra;
-            }
-        }
-    }
-    
-    return root;
-}
-
-// ─── Graph Write ────────────────────────────────────────────────────────────
-
-int TableStore::graphWrite(const Array<GraphOp>& ops, const String& encryptionKey, u64 txId, bool isVolatile) {
-    Array<u64> activeIds;
-    
-    for (usz opIdx = 0; opIdx < ops.size(); ++opIdx) {
-        const GraphOp& op = ops[opIdx];
-        
-        if (op.type == GraphOpType::MATCH) {
-            for (u64 rId : allRowIds) {
-                Map<String, String>* row = fetchRow(rId);
-                if (!row) continue;
-                if (evaluateClauses(*row, op.query) >= 0.0f) {
-                    activeIds.push(rId);
-                }
-            }
-        } else if (op.type == GraphOpType::FOLLOW) {
-            Array<u64> nextActive;
-            bool fastPath = false;
-            long long fastClauseIdx = -1;
-            if (op.query.size() == 1) {
-                for (usz ci = 0; ci < op.query[0].size(); ++ci) {
-                    if (op.query[0][ci].op == "=" && op.query[0][ci].val.startsWith("parent.")) {
-                        fastPath = true;
-                        fastClauseIdx = (long long)ci;
-                        break;
-                    }
-                }
-            }
-            
-            if (fastPath && !disableIndex) {
-                if (colHashIndexDirty) rebuildColHashIndex();
-                String targetCol = op.query[0][fastClauseIdx].col;
-                String parentKey = op.query[0][fastClauseIdx].val.substring(7);
-                auto* valMap = colHashIndex.get(targetCol);
-                
-                for (u64 parentId : activeIds) {
-                    Map<String, String>* pRow = fetchRow(parentId);
-                    if (!pRow) continue;
-                    if (!pRow->has(parentKey)) continue;
-                    String targetVal = *pRow->get(parentKey);
-                    
-                    if (valMap) {
-                        auto* rowIds = valMap->get(targetVal);
-                        if (rowIds) {
-                            for (u64 rId : *rowIds) {
-                                Map<String, String>* row = fetchRow(rId);
-                                if (!row) continue;
-                                if (evaluateClauses(*row, op.query, pRow) >= 0.0f) {
-                                    nextActive.push(rId);
-                                }
-                            }
-                        }
-                    }
-                }
-            } else {
-                for (u64 parentId : activeIds) {
-                    Map<String, String>* pRow = fetchRow(parentId);
-                    if (!pRow) continue;
-                    for (u64 rId : allRowIds) {
-                        Map<String, String>* row = fetchRow(rId);
-                        if (!row) continue;
-                        if (evaluateClauses(*row, op.query, pRow) >= 0.0f) {
-                            nextActive.push(rId);
-                        }
-                    }
-                }
-            }
-            activeIds = nextActive;
-        } else if (op.type == GraphOpType::UNTIL) {
-            Array<u64> nextActive;
-            for (u64 id : activeIds) {
-                Map<String, String>* row = fetchRow(id);
-                if (row && evaluateClauses(*row, op.query) < 0.0f) {
-                    nextActive.push(id);
-                }
-            }
-            activeIds = nextActive;
-        } else if (op.type == GraphOpType::REPEATFOLLOW) {
-            Array<u64> currentLevel = activeIds;
-            Array<u64> allFound;
-            Map<u64, bool> visited;
-            for (u64 id : currentLevel) visited.set(id, true);
-            
-            bool fastPath = false;
-            long long fastClauseIdx = -1;
-            if (op.query.size() == 1) {
-                for (usz ci = 0; ci < op.query[0].size(); ++ci) {
-                    if (op.query[0][ci].op == "=" && op.query[0][ci].val.startsWith("parent.")) {
-                        fastPath = true;
-                        fastClauseIdx = (long long)ci;
-                        break;
-                    }
-                }
-            }
-            
-            while (currentLevel.size() > 0) {
-                Array<u64> nextLevel;
-                if (fastPath && !disableIndex) {
-                    if (colHashIndexDirty) rebuildColHashIndex();
-                    String targetCol = op.query[0][fastClauseIdx].col;
-                    String parentKey = op.query[0][fastClauseIdx].val.substring(7);
-                    auto* valMap = colHashIndex.get(targetCol);
-                    
-                    for (u64 parentId : currentLevel) {
-                        Map<String, String>* pRow = fetchRow(parentId);
-                        if (!pRow) continue;
-                        if (op.untilQuery.size() > 0 && evaluateClauses(*pRow, op.untilQuery) >= 0.0f) continue;
-                        if (!pRow->has(parentKey)) continue;
-                        String targetVal = *pRow->get(parentKey);
-                        
-                        if (valMap) {
-                            auto* rowIds = valMap->get(targetVal);
-                            if (rowIds) {
-                                for (u64 rId : *rowIds) {
-                                    if (visited.has(rId)) continue;
-                                    Map<String, String>* row = fetchRow(rId);
-                                    if (!row) continue;
-                                    if (evaluateClauses(*row, op.query, pRow) >= 0.0f) {
-                                        nextLevel.push(rId);
-                                        allFound.push(rId);
-                                        visited.set(rId, true);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    for (u64 parentId : currentLevel) {
-                        Map<String, String>* pRow = fetchRow(parentId);
-                        if (!pRow) continue;
-                        if (op.untilQuery.size() > 0 && evaluateClauses(*pRow, op.untilQuery) >= 0.0f) {
-                            continue;
-                        }
-                        for (u64 rId : allRowIds) {
-                            if (visited.has(rId)) continue;
-                            Map<String, String>* row = fetchRow(rId);
-                            if (!row) continue;
-                            if (evaluateClauses(*row, op.query, pRow) >= 0.0f) {
-                                nextLevel.push(rId);
-                                allFound.push(rId);
-                                visited.set(rId, true);
-                            }
-                        }
-                    }
-                }
-                currentLevel = nextLevel;
-            }
-            activeIds = allFound;
-        } else if (op.type == GraphOpType::SET) {
-            for (u64 id : activeIds) {
-                Map<String, String>* row = fetchRow(id);
-                if (!row) continue;
-                
-                String keyToUse = encryptionKey;
-                if (keyToUse.isEmpty() && globalKeys) {
-                    for (const auto& existingCol : op.writeSet) {
-                        if (row->has(existingCol.col)) {
-                            String dummyKey;
-                            CryptItem::decrypt(*row->get(existingCol.col), *globalKeys, &dummyKey);
-                            if (!dummyKey.isEmpty()) {
-                                keyToUse = dummyKey;
-                                break;
-                            }
-                        }
-                    }
-                }
-                
-                for (const auto& col : op.writeSet) {
-                    ParsedCol pc = parseCol(col.col);
-                    if (pc.type == ColType::VIRTUAL) continue;
-                    
-                    if (pc.type == ColType::BLOB && blobStore) {
-                        String content = col.val;
-                        if (pc.rangeSpec.size() > 0) {
-                            BlobRange br = parseBlobRange(pc.rangeSpec);
-                            if (br.valid && row->has(pc.name)) {
-                                String existing = resolveValue(*row->get(pc.name));
-                                content = applyBlobRange(existing, col.val, br);
-                            }
-                        }
-                        String hash = Sec::hash(content, 16);
-                        blobStore->writeHash(hash, 0, content, keyToUse);
-                        String ref = makeBlobRef(hash);
-                        row->set(pc.name, keyToUse.isEmpty() ? ref : CryptItem::encrypt(ref, keyToUse));
-                    } else {
-                        row->set(pc.name, keyToUse.isEmpty() ? col.val : CryptItem::encrypt(col.val, keyToUse));
-                    }
-                }
-                
-                currentSeq++;
-                rowModSeq.set(id, currentSeq);
-                if (isVolatile) volatileRows.set(id, true);
-                currentMemoryBytes += approxRowBytes(*row); 
-                updateLru(id);
-            }
-            evictIfNeeded();
-        } else if (op.type == GraphOpType::REMOVE) {
-            for (u64 id : activeIds) {
-                if (isVolatile) {
-                    if (volatileRows.has(id)) {
-                        volatileRows.remove(id);
-                        allRows.remove(id);
-                        rowModSeq.set(id, currentSeq + 1);
-                    }
-                } else {
-                    currentSeq++;
-                    Map<String, String> dummy;
-                    dummy.set("___tombstone", "1");
-                    allRows.set(id, dummy);
-                    rowModSeq.set(id, currentSeq);
-                }
-            }
-        }
-    }
-    return 0;
-}
 
 // ─── Flush ──────────────────────────────────────────────────────────────────
 
@@ -1837,6 +1462,276 @@ void TableStore::flushHnsw() {
     for (auto& pair : hnsw->nodes) {
         saveHNSWToDisk(pair.key, pair.value);
     }
+}
+
+static bool isRegexSyntax(const String& pattern) {
+    for (usz i = 0; i < pattern.size(); ++i) {
+        char c = pattern[i];
+        if (c == '\\') {
+            if (i + 1 < pattern.size()) {
+                char next = pattern[i+1];
+                if (next == 'd' || next == 'D' || next == 'w' || next == 'W' || next == 's' || next == 'S' || next == 'b' || next == 'B') {
+                    return true;
+                }
+                i++;
+            }
+        } else if (c == '[' || c == '(' || c == '^' || c == '$' || c == '|' || c == '+') {
+            return true;
+        } else if (c == '.') {
+            if (i + 1 < pattern.size() && (pattern[i+1] == '*' || pattern[i+1] == '+')) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static String globToRegex(const String& glob) {
+    String re;
+    for (usz i = 0; i < glob.size(); ++i) {
+        char c = glob[i];
+        if (c == '\\') {
+            if (i + 1 < glob.size()) {
+                char next = glob[i+1];
+                if (next == '*') {
+                    re += "\\*";
+                    i++;
+                } else if (next == '?') {
+                    re += "\\?";
+                    i++;
+                } else {
+                    re += "\\\\";
+                }
+            } else {
+                re += "\\\\";
+            }
+        } else if (c == '*') {
+            re += ".*";
+        } else if (c == '?') {
+            re += ".";
+        } else if (c == '.' || c == '+' || c == '(' || c == ')' || c == '[' || c == ']' ||
+                   c == '{' || c == '}' || c == '^' || c == '$' || c == '|' || c == '$') {
+            re += "\\";
+            re += c;
+        } else {
+            re += c;
+        }
+    }
+    return re;
+}
+
+static bool matchPattern(const String& segVal, const String& pattern) {
+    if (isRegexSyntax(pattern)) {
+        try {
+            std::string sv((const char*)segVal.data(), segVal.size());
+            std::string pt((const char*)pattern.data(), pattern.size());
+            std::regex re(pt);
+            return std::regex_match(sv, re);
+        } catch (...) {
+        }
+    }
+    
+    bool hasGlob = false;
+    for (usz i = 0; i < pattern.size(); ++i) {
+        if (pattern[i] == '\\') {
+            i++;
+        } else if (pattern[i] == '*' || pattern[i] == '?') {
+            hasGlob = true;
+            break;
+        }
+    }
+    
+    if (hasGlob) {
+        String reStr = globToRegex(pattern);
+        try {
+            std::string sv((const char*)segVal.data(), segVal.size());
+            std::string pt((const char*)reStr.data(), reStr.size());
+            std::regex re(pt);
+            return std::regex_match(sv, re);
+        } catch (...) {
+        }
+    }
+    
+    String unescaped;
+    for (usz i = 0; i < pattern.size(); ++i) {
+        char c = pattern[i];
+        if (c == '\\') {
+            if (i + 1 < pattern.size()) {
+                unescaped += (char)pattern[i+1];
+                i++;
+            } else {
+                unescaped += '\\';
+            }
+        } else {
+            unescaped += c;
+        }
+    }
+    return segVal == unescaped;
+}
+
+Array<u64> TableStore::resolvePathPattern(const String& colName, const String& pathPattern, u64 snapshotSeq, u64 txId) {
+    Array<u64> matchingRowIds;
+    
+    String p = pathPattern;
+    if (p.startsWith("\"") && p.endsWith("\"")) p = p.slice(1, p.size() - 1);
+    Array<String> parts = p.split("/");
+    Array<String> cleanParts;
+    for (usz i = 0; i < parts.size(); ++i) {
+        if (!parts[i].isEmpty()) cleanParts.push(parts[i]);
+    }
+    
+    Array<String> currentParentVals;
+    currentParentVals.push("0");
+    
+    for (usz step = 0; step < cleanParts.size(); ++step) {
+        const String& seg = cleanParts[step];
+        Array<String> nextParentVals;
+        Array<u64> stepMatchingRowIds;
+        
+        if (seg == "*") {
+            for (u64 rId : allRowIds) {
+                if (!isVisibleToSnapshot(rId, snapshotSeq, txId)) continue;
+                Map<String, String>* row = fetchRow(rId);
+                if (!row) continue;
+                
+                String pId = row->has("parent_id") ? *row->get("parent_id") : "0";
+                if (globalKeys) pId = CryptItem::decrypt(pId, *globalKeys);
+                
+                bool matchParent = false;
+                for (usz j = 0; j < currentParentVals.size(); ++j) {
+                    if (pId == currentParentVals[j]) { matchParent = true; break; }
+                }
+                
+                if (matchParent) {
+                    String idVal = row->has("id") ? *row->get("id") : "";
+                    if (globalKeys) idVal = CryptItem::decrypt(idVal, *globalKeys);
+                    if (!idVal.isEmpty()) {
+                        nextParentVals.push(idVal);
+                        stepMatchingRowIds.push(rId);
+                    }
+                }
+            }
+        } else if (seg == "**") {
+            // BFS to collect all descendants, including starting parent values
+            Array<String> descendants = currentParentVals;
+            
+            for (usz j = 0; j < currentParentVals.size(); ++j) {
+                for (u64 rId : allRowIds) {
+                    if (!isVisibleToSnapshot(rId, snapshotSeq, txId)) continue;
+                    Map<String, String>* row = fetchRow(rId);
+                    if (row && row->has("id")) {
+                        String idVal = *row->get("id");
+                        if (globalKeys) idVal = CryptItem::decrypt(idVal, *globalKeys);
+                        if (idVal == currentParentVals[j]) {
+                            stepMatchingRowIds.push(rId);
+                        }
+                    }
+                }
+            }
+            
+            Array<String> queue = currentParentVals;
+            Map<String, bool> visited;
+            for (usz j = 0; j < currentParentVals.size(); ++j) visited.set(currentParentVals[j], true);
+            
+            usz qIdx = 0;
+            while (qIdx < queue.size()) {
+                String pVal = queue[qIdx++];
+                
+                for (u64 rId : allRowIds) {
+                    if (!isVisibleToSnapshot(rId, snapshotSeq, txId)) continue;
+                    Map<String, String>* row = fetchRow(rId);
+                    if (!row) continue;
+                    
+                    String pId = row->has("parent_id") ? *row->get("parent_id") : "0";
+                    if (globalKeys) pId = CryptItem::decrypt(pId, *globalKeys);
+                    
+                    if (pId == pVal) {
+                        String idVal = row->has("id") ? *row->get("id") : "";
+                        if (globalKeys) idVal = CryptItem::decrypt(idVal, *globalKeys);
+                        if (!idVal.isEmpty() && !visited.has(idVal)) {
+                            visited.set(idVal, true);
+                            descendants.push(idVal);
+                            queue.push(idVal);
+                            stepMatchingRowIds.push(rId);
+                        }
+                    }
+                }
+            }
+            nextParentVals = descendants;
+        } else {
+            for (u64 rId : allRowIds) {
+                if (!isVisibleToSnapshot(rId, snapshotSeq, txId)) continue;
+                Map<String, String>* row = fetchRow(rId);
+                if (!row) continue;
+                
+                String pId = row->has("parent_id") ? *row->get("parent_id") : "0";
+                if (globalKeys) pId = CryptItem::decrypt(pId, *globalKeys);
+                
+                bool matchParent = false;
+                for (usz j = 0; j < currentParentVals.size(); ++j) {
+                    if (pId == currentParentVals[j]) { matchParent = true; break; }
+                }
+                
+                if (matchParent) {
+                    String segVal = row->has(colName) ? *row->get(colName) : "";
+                    if (globalKeys) segVal = CryptItem::decrypt(segVal, *globalKeys);
+                    
+                    if (matchPattern(segVal, seg)) {
+                        String idVal = row->has("id") ? *row->get("id") : "";
+                        if (globalKeys) idVal = CryptItem::decrypt(idVal, *globalKeys);
+                        if (!idVal.isEmpty()) {
+                            nextParentVals.push(idVal);
+                            stepMatchingRowIds.push(rId);
+                        }
+                    }
+                }
+            }
+        }
+        
+        currentParentVals = nextParentVals;
+        if (step == cleanParts.size() - 1) {
+            matchingRowIds = stepMatchingRowIds;
+        }
+    }
+    
+    return matchingRowIds;
+}
+
+void TableStore::resolvePathsInClauses(const Array<Clauses>& clauses, u64 snapshotSeq, u64 txId) {
+    precomputedPaths.clear();
+    for (usz gi = 0; gi < clauses.size(); ++gi) {
+        const auto& group = clauses[gi];
+        for (const auto& clause : group) {
+            if (clause.op == "path") {
+                String key = clause.col + "::" + clause.val;
+                if (!precomputedPaths.has(key)) {
+                    precomputedPaths.set(key, resolvePathPattern(clause.col, clause.val, snapshotSeq, txId));
+                }
+            }
+        }
+    }
+}
+
+void TableStore::rebuildBloomFilters() {
+    for (auto it = colBloomFilters.begin(); it != colBloomFilters.end(); ++it) {
+        delete it->value;
+    }
+    colBloomFilters.clear();
+    
+    for (u64 rId : allRowIds) {
+        Map<String, String>* row = fetchRow(rId);
+        if (!row) continue;
+        for (auto it = row->begin(); it != row->end(); ++it) {
+            String val = it->value;
+            if (globalKeys) val = CryptItem::decrypt(val, *globalKeys);
+            
+            if (!colBloomFilters.has(it->key)) {
+                colBloomFilters.set(it->key, new BloomFilter(8192));
+            }
+            (*colBloomFilters.get(it->key))->add(val);
+        }
+    }
+    colBloomFiltersDirty = false;
 }
 
 } // namespace Xylem

@@ -40,6 +40,9 @@ struct BlobMeta {
     u32 ref;            // Reference handle (1-based, 0 = unassigned)
     bool frozen;        // Whether this blob is frozen at fixedPosition
     bool used;          // Whether this blob is actively referenced by items
+    bool isDiff = false; // Whether this blob is stored as a diff
+    String baseHash;    // The base hash this diff is relative to
+    u64 seq = 0;        // Sequence when this blob became a diff
 };
 
 struct PendingFreeze {
@@ -142,7 +145,13 @@ public:
 
     // Stores content keyed by hash; no-op if hash already present (content dedup)
     bool writeHash(const String& hash, u64 minOffset, const String& data,
-                   const String& encryptionKey = "");
+                   const String& encryptionKey = "", const String& oldHash = "", u64 seq = 0);
+
+    // Stores diff data keyed by hash, referencing baseHash
+    bool writeDiffHash(const String& hash, const String& baseHash, const String& diffBin,
+                       const String& encryptionKey = "");
+    bool writeHashInternal(const String& hash, u64 minOffset, const String& data,
+                           const String& encryptionKey = "");
 
     // Moves a blob to a fixed byte address (relocating anything in the way)
     bool fixBlob(const String& hash, u64 byteAddress);

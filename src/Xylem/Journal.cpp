@@ -370,11 +370,7 @@ void Journal::deserializeAndApply(TableStore* ts, JournalOpType type, const Stri
         ts->remove(clauses, length);
     }
     else if (type == JournalOpType::ROW_WRITE) { 
-        u64 opsLen = readU64(ptr);
-        Array<GraphOp> ops;
-        for (u64 i = 0; i < opsLen; ++i) ops.push(readGraphOp(ptr));
-        String key = readStr(ptr);
-        ts->graphWrite(ops, key);
+        // Obsolete graphWrite is a no-op during journal recovery
     }
 }
 

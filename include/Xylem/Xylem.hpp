@@ -53,18 +53,15 @@ public:
     int writeVolatile(const Array<Clause>& columns, const Array<Clauses>& clauses = Array<Clauses>(),
                       u64 txId = 0, const String& encryptionKey = "");
     bool remove(const Array<Clauses>& clauses, u64 length = 0, u64 as = 0);
-    
-    // Advanced Graph Traversal
-    Collection::TreeBranch* graphRead(const Array<String>& columns, const Array<GraphOp>& ops,
-                                       u64 limit = 0, u64 txId = 0);
-    int graphWrite(const Array<GraphOp>& ops, u64 txId = 0, const String& encryptionKey = "");
-    int graphWriteVolatile(const Array<GraphOp>& ops, u64 txId = 0, const String& encryptionKey = "");
+
 
     // Transactions (MVCC)
     // Returns: 0 = success, -1 = invalid lock, -2 = MVCC conflict (auto-rolled-back)
     u64 lock(const Array<Clauses>& clauses = Array<Clauses>(), u64 id = 0, bool requiresExplicitAs = true);
+    u64 commit(const Array<Clauses>& clauses = Array<Clauses>(), u64 id = 0);
     bool rollback(u64 id);
     int  unlock(u64 id);
+    void mergeUnusedDiffs();
 
     String generateId(const String& column);
 

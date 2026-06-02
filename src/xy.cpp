@@ -664,119 +664,100 @@ int main(int argc, char **argv) {
       String xylemPath = resolvePath(pwd, tokens[1]);
       String linuxPath = tokens[2];
 
-      String q = "GR EXTRACT \"" + xylemPath + "\"";
+      String q = "READ WHERE name path \"" + xylemPath + "/**\"";
       QueryResult res = xm.query(q);
-      if (res.treeResult && res.treeResult->size() > 0) {
-        struct ScanContext {
-          XylemEngine *xm;
-          u64 totalFiles = 0;
-          u64 totalBytes = 0;
-          void (*scan)(ScanContext *, const TreeItem *);
-        };
-        ScanContext sCtx;
-        sCtx.xm = &xm;
-        sCtx.scan = [](ScanContext *c, const TreeItem *node) {
-          if (!node) return;
-          const RowNode *rn = getDeepestRowNode(const_cast<TreeItem *>(node));
-          if (!rn) return;
-          String type = "";
-          if (rn->row.has("type"))
-            type = *rn->row.get("type");
-          if (type == "dir") {
-            for (usz i = 0; i < rn->size(); ++i) {
-              if ((*rn)[i]) c->scan(c, (*rn)[i]);
-            }
-          } else {
-            c->totalFiles++;
-            if (rn->row.has("content")) {
-              c->totalBytes += rn->row.get("content")->size();
-            } else if (rn->row.has("content:blob")) {
-              c->totalBytes += c->xm->getBlobSize(rn->row.get("content:blob")->toInt());
+      if (res.code >= 0 && res.readRows.size() > 0) {
+        // Reconstruct tree and process
+        // 1. Put all rows in a map by ID
+        Map<String, const Map<String, String>*> rowMap;
+        for (usz i = 0; i < res.readRows.size(); ++i) {
+          if (res.readRows[i].has("id")) {
+            rowMap.set(*res.readRows[i].get("id"), &res.readRows[i]);
+          }
+        }
+
+        // 2. Count total files and total bytes for progress
+        u64 totalFiles = 0;
+        u64 totalBytes = 0;
+        for (usz i = 0; i < res.readRows.size(); ++i) {
+          const auto& row = res.readRows[i];
+          String type = row.has("type") ? *row.get("type") : "";
+          if (type == "file") {
+            totalFiles++;
+            if (row.has("content")) {
+              totalBytes += row.get("content")->size();
+            } else if (row.has("content:blob")) {
+              totalBytes += row.get("content:blob")->size();
             }
           }
-        };
-        sCtx.scan(&sCtx, (*res.treeResult)[0]);
+        }
 
         Progress progress;
-        usz taskIdx = progress.addLinearTask(sCtx.totalBytes, "B", "Extracting files");
+        usz taskIdx = progress.addLinearTask(totalBytes, "B", "Extracting files");
         progress.update();
 
-        struct ExtractContext {
-          XylemEngine *xm;
-          Progress *progress;
-          usz taskIdx;
-          void (*extract)(ExtractContext *, const TreeItem *, const String &);
-        };
-        ExtractContext ctx;
-        ctx.xm = &xm;
-        ctx.progress = &progress;
-        ctx.taskIdx = taskIdx;
-        ctx.extract = [](ExtractContext *c, const TreeItem *node,
-                         const String &lPath) {
-          if (!node)
-            return;
-          const RowNode *rn = getDeepestRowNode(const_cast<TreeItem *>(node));
-          if (!rn)
-            return;
-
-          String type = "";
-          if (rn->row.has("type"))
-            type = *rn->row.get("type");
-
-          if (type == "dir") {
-            std::filesystem::create_directories((const char *)lPath.data());
-            for (usz i = 0; i < rn->size(); ++i) {
-              if ((*rn)[i]) {
-                const RowNode *child = getDeepestRowNode((*rn)[i]);
-                if (child && child->row.has("name")) {
-                  String childName = *child->row.get("name");
-                  c->extract(c, (*rn)[i], lPath + "/" + childName);
-                }
+        // 3. For each row, resolve its destination path and write/create it
+        for (usz i = 0; i < res.readRows.size(); ++i) {
+          const auto& row = res.readRows[i];
+          String type = row.has("type") ? *row.get("type") : "";
+          String name = row.has("name") ? *row.get("name") : "";
+          String id = row.has("id") ? *row.get("id") : "";
+          
+          // Walk up to find destination path
+          Array<String> pathSegs;
+          const Map<String, String>* curr = &row;
+          bool isRootFile = false;
+          
+          while (curr) {
+            String pId = curr->has("parent_id") ? *curr->get("parent_id") : "0";
+            if (!rowMap.has(pId)) {
+              // curr is a root node
+              String currType = curr->has("type") ? *curr->get("type") : "";
+              if (currType == "file") {
+                isRootFile = true;
               }
+              break;
             }
-          } else {
-            String content;
-            bool foundContent = false;
-            if (rn->row.has("content")) {
-              content = *rn->row.get("content");
-              foundContent = true;
-            } else if (rn->row.has("content:blob")) {
-              content = c->xm->getBlob(rn->row.get("content:blob")->toInt());
-              foundContent = true;
-            }
-            if (foundContent) {
-              std::ofstream file((const char *)lPath.data(), std::ios::binary);
-              if (file.is_open()) {
-                file.write((const char *)content.data(), content.size());
-                String filename = lPath;
-                long long slash = -1;
-                for (long long i = (long long)lPath.length() - 1; i >= 0; --i) {
-                  if (lPath.charAt(i) == '/') {
-                    slash = i;
-                    break;
-                  }
-                }
-                if (slash >= 0) filename = lPath.substring(slash + 1);
-                c->progress->addLinearTaskDelta(c->taskIdx, content.size(), "Writing " + filename);
-                c->progress->update();
-              } else {
-                printf("Error: Could not write to Linux file %s\n",
-                       lPath.data());
-              }
-            } else {
-              printf("Error: Node has no 'content' column.\n");
+            pathSegs.push(curr->has("name") ? *curr->get("name") : "");
+            curr = *rowMap.get(pId);
+          }
+          
+          String destPath = linuxPath;
+          if (!isRootFile) {
+            // Prepend segments in reverse order
+            for (long long j = (long long)pathSegs.size() - 1; j >= 0; --j) {
+              destPath += "/" + pathSegs[j];
             }
           }
-        };
-        ctx.extract(&ctx, (*res.treeResult)[0], linuxPath);
-
+          
+          if (type == "dir") {
+            std::filesystem::create_directories((const char*)destPath.data());
+          } else {
+            // Ensure parent directories exist
+            std::filesystem::path dp((const char*)destPath.data());
+            std::filesystem::create_directories(dp.parent_path());
+            
+            String content;
+            if (row.has("content")) {
+              content = *row.get("content");
+            } else if (row.has("content:blob")) {
+              content = *row.get("content:blob");
+            }
+            
+            std::ofstream file((const char*)destPath.data(), std::ios::binary);
+            if (file.is_open()) {
+              file.write((const char*)content.data(), content.size());
+              file.close();
+            }
+            progress.addLinearTaskDelta(taskIdx, content.size(), "Writing " + name);
+            progress.update();
+          }
+        }
         progress.destroy();
-        Terminal::Success("Export complete: " + String::from((long long)sCtx.totalFiles) + " files (" + String::from((long long)sCtx.totalBytes) + " bytes) successfully exported.");
+        Terminal::Success("Export complete: " + String::from((long long)totalFiles) + " files (" + String::from((long long)totalBytes) + " bytes) successfully exported.");
       } else {
         printf("Error: Xylem path not found.\n");
       }
-      if (res.treeResult)
-        delete res.treeResult;
       continue;
     }
 

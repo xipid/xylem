@@ -1,5 +1,6 @@
 #include <Xylem/BlobStore.hpp>
 #include <Xylem/CryptItem.hpp>
+#include <Xylem/XBDiff.hpp>
 
 namespace Xylem {
 
@@ -9,12 +10,18 @@ BlobStore::BlobStore(BlockDevice* dev, Allocator* alloc, Array<String>* keys)
 // ─── helpers ────────────────────────────────────────────────────────────────
 
 // Header overhead for first block: 3 bytes fixed + keyLen + 4+4+4 = 15 + keyLen
-static inline u32 firstBlockOverhead(u32 keyLen) { return 15 + keyLen + 4; /* +4 CRC */ }
+static inline u32 firstBlockOverhead(u32 keyLen, bool isDiff = false, u32 baseHashLen = 0) {
+    u32 oh = 15 + keyLen + 4; /* +4 CRC */
+    if (isDiff) {
+        oh += 1 + baseHashLen; // 1 byte for baseHashLen + baseHash bytes
+    }
+    return oh;
+}
 // Header overhead for continuation blocks: 3 + 0 + 4+4+4 = 15 + 4 CRC
 static constexpr u32 CONT_OVERHEAD = 19;
 
-static u32 firstBlockCap(u32 blockSize, u32 keyLen) {
-    u32 oh = firstBlockOverhead(keyLen);
+static u32 firstBlockCap(u32 blockSize, u32 keyLen, bool isDiff = false, u32 baseHashLen = 0) {
+    u32 oh = firstBlockOverhead(keyLen, isDiff, baseHashLen);
     return (blockSize > oh) ? blockSize - oh : 0;
 }
 static u32 contBlockCap(u32 blockSize) {
@@ -29,6 +36,47 @@ String BlobStore::readHash(const String& hash, u64 minOffset, u64 maxOffset) {
     if (!bloomMayExist(hash)) return String();
     auto* m = index.get(hash);
     if (!m) return String();
+
+    if (m->isDiff) {
+        String baseData = readHash(m->baseHash, 0, 0xFFFFFFFF);
+        String diffBin;
+        if (device && device->config.onDeviceRead && m->blockIdx != 0) {
+            diffBin = readChain(m->blockIdx);
+        } else {
+            return String();
+        }
+
+        String savedDict;
+        bool isTableRoot = (hash == "XYLM_TABLE_ROOT");
+#ifdef XI_ZSTD_ENABLED
+        if (isTableRoot && zstd.dictionary.size() > 0) {
+            savedDict = zstd.dictionary[0];
+            zstd.setDictionary(String());
+        }
+        diffBin = zstd.decompress(diffBin);
+        if (isTableRoot && !savedDict.isEmpty()) {
+            zstd.setDictionary(savedDict);
+        }
+#endif
+        if (globalKeys && globalKeys->size() > 0) {
+            String decrypted = CryptItem::decrypt(diffBin, *globalKeys);
+            if (!decrypted.isEmpty()) diffBin = decrypted;
+        }
+
+        XBDiff diff = XBDiff::fromBinary(diffBin, baseData);
+        diff.blobStore = this;
+        String data = diff.toBinaryContent(this);
+
+        if (maxOffset > 0 && maxOffset > minOffset) {
+            u64 len = maxOffset - minOffset;
+            if (len > (u64)data.size() - minOffset) len = (u64)data.size() - minOffset;
+            return data.slice((usz)minOffset, (usz)len);
+        }
+        if (minOffset > 0) {
+            return data.slice((usz)minOffset);
+        }
+        return data;
+    }
 
     String data;
     if (device && device->config.onDeviceRead) {
@@ -97,14 +145,24 @@ String BlobStore::readHash(const String& hash, u64 minOffset, u64 maxOffset) {
     return data;
 }
 
-bool BlobStore::writeHash(const String& hash, u64 /*minOffset*/, const String& data,
-                          const String& encryptionKey) {
+bool BlobStore::writeHashInternal(const String& hash, u64 /*minOffset*/, const String& data,
+                                  const String& encryptionKey) {
     // Zero-cost dedup for true content-addressed blobs
     if (index.has(hash)) return true;
 
     if (!device || !device->config.onDeviceWrite || !allocator) {
         // No device available — store a placeholder so the key registers
-        BlobMeta meta = { 0, 0, 0, (u32)data.size() };
+        BlobMeta meta;
+        meta.blockIdx = 0;
+        meta.offset = 0;
+        meta.length = 0;
+        meta.originalSize = (u32)data.size();
+        meta.fixedPosition = 0;
+        meta.ref = 0;
+        meta.frozen = false;
+        meta.used = false;
+        meta.isDiff = false;
+        meta.seq = 0;
         index.set(hash, meta);
         return false;
     }
@@ -138,7 +196,7 @@ bool BlobStore::writeHash(const String& hash, u64 /*minOffset*/, const String& d
 
     u32 blockSize = device->config.blockSize;
     u32 keyLen    = (u32)hash.size();
-    u32 fCap      = firstBlockCap(blockSize, keyLen);
+    u32 fCap      = firstBlockCap(blockSize, keyLen, false, 0);
     u32 cCap      = contBlockCap(blockSize);
     if (fCap == 0 || cCap == 0) return false;
 
@@ -203,7 +261,173 @@ bool BlobStore::writeHash(const String& hash, u64 /*minOffset*/, const String& d
         dataOffset += chunkLen;
     }
 
-    BlobMeta meta = { blockIdxs[0], 0, totalLen, origSize, 0 };
+    BlobMeta meta;
+    meta.blockIdx = blockIdxs[0];
+    meta.offset = 0;
+    meta.length = totalLen;
+    meta.originalSize = origSize;
+    meta.fixedPosition = 0;
+    meta.ref = 0;
+    meta.frozen = false;
+    meta.used = false;
+    meta.isDiff = false;
+    meta.seq = 0;
+    index.set(hash, meta);
+    bloomInsert(hash);
+    return true;
+}
+
+bool BlobStore::writeHash(const String& hash, u64 minOffset, const String& data,
+                          const String& encryptionKey, const String& oldHash, u64 seq) {
+    if (index.has(hash)) return true;
+
+    bool ok = writeHashInternal(hash, minOffset, data, encryptionKey);
+    if (!ok) return false;
+
+    // Convert oldHash to a diff relative to hash
+    if (!oldHash.isEmpty() && index.has(oldHash)) {
+        auto* oldMeta = index.get(oldHash);
+        if (oldMeta && !oldMeta->isDiff && !oldMeta->frozen) {
+            String oldData = readHash(oldHash, 0, 0xFFFFFFFF);
+            if (!oldData.isEmpty()) {
+                XBDiff diff = XBDiff::create(data, oldData);
+                String diffBin = diff.toBinary();
+                
+                u32 oldRef = oldMeta->ref;
+                bool oldUsed = oldMeta->used;
+                
+                removeHash(oldHash);
+                writeDiffHash(oldHash, hash, diffBin, encryptionKey);
+                
+                auto* newOldMeta = index.get(oldHash);
+                if (newOldMeta) {
+                    newOldMeta->ref = oldRef;
+                    newOldMeta->used = oldUsed;
+                    newOldMeta->seq = seq;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+bool BlobStore::writeDiffHash(const String& hash, const String& baseHash, const String& diffBin,
+                              const String& encryptionKey) {
+    if (index.has(hash)) return true;
+
+    if (!device || !device->config.onDeviceWrite || !allocator) {
+        BlobMeta meta;
+        meta.blockIdx = 0;
+        meta.offset = 0;
+        meta.length = 0;
+        meta.originalSize = (u32)diffBin.size();
+        meta.fixedPosition = 0;
+        meta.ref = 0;
+        meta.frozen = false;
+        meta.used = false;
+        meta.isDiff = true;
+        meta.baseHash = baseHash;
+        meta.seq = 0;
+        index.set(hash, meta);
+        return false;
+    }
+
+    u32 origSize = (u32)diffBin.size();
+    String payload = diffBin;
+    if (!encryptionKey.isEmpty()) {
+        payload = CryptItem::encrypt(diffBin, encryptionKey);
+    }
+
+    String savedDict;
+    bool isTableRoot = (hash == "XYLM_TABLE_ROOT");
+#ifdef XI_ZSTD_ENABLED
+    if (isTableRoot && zstd.dictionary.size() > 0) {
+        savedDict = zstd.dictionary[0];
+        zstd.setDictionary(String());
+    }
+    payload = zstd.compress(payload);
+    if (isTableRoot && !savedDict.isEmpty()) {
+        zstd.setDictionary(savedDict);
+    }
+#endif
+
+    u32 blockSize = device->config.blockSize;
+    u32 keyLen    = (u32)hash.size();
+    u32 baseHashLen = (u32)baseHash.size();
+    u32 fCap      = firstBlockCap(blockSize, keyLen, true, baseHashLen);
+    u32 cCap      = contBlockCap(blockSize);
+    if (fCap == 0 || cCap == 0) return false;
+
+    u32 totalLen = (u32)payload.size();
+    u32 numBlocks = 1;
+    if (totalLen > fCap) {
+        u32 remaining = totalLen - fCap;
+        numBlocks += (remaining + cCap - 1) / cCap;
+    }
+
+    InlineArray<u32> blockIdxs;
+    blockIdxs.allocate(numBlocks);
+    for (u32 i = 0; i < numBlocks; ++i) {
+        u32 bIdx = allocator->allocBlock(BlockType::BLOB);
+        if (bIdx == 0) {
+            for (u32 j = 0; j < i; ++j) {
+                allocator->bam[blockIdxs[j]].setStatus(BlockStatus::FREE);
+                allocator->bam[blockIdxs[j]].setType(BlockType::FREE);
+                allocator->freeHeap.push({allocator->bam[blockIdxs[j]].eraseCount, blockIdxs[j]});
+            }
+            return false;
+        }
+        blockIdxs[i] = bIdx;
+    }
+
+    u32 dataOffset = 0;
+    for (u32 b = 0; b < numBlocks; ++b) {
+        bool isFirst  = (b == 0);
+        u32  cap      = isFirst ? fCap : cCap;
+        u32  chunkLen = (totalLen - dataOffset < cap) ? (totalLen - dataOffset) : cap;
+        u32  nextBlk  = (b + 1 < numBlocks) ? blockIdxs[b + 1] : 0u;
+
+        String buf; buf.allocate(blockSize);
+        buf.fill(0xFF);
+        u8* ptr       = (u8*)buf.data();
+        u8* blkStart  = ptr;
+
+        *ptr++ = (u8)BlockType::BLOB;
+        *ptr++ = isFirst ? 2u : 0u; // 2 = diff first block
+        *ptr++ = isFirst ? (u8)keyLen : 0u;
+        if (isFirst) {
+            for (u32 k = 0; k < keyLen; ++k) *ptr++ = hash[k];
+            *ptr++ = (u8)baseHashLen;
+            for (u32 k = 0; k < baseHashLen; ++k) *ptr++ = baseHash[k];
+        }
+        *(u32*)ptr = isFirst ? totalLen : 0u; ptr += 4;
+        *(u32*)ptr = chunkLen;                ptr += 4;
+        *(u32*)ptr = nextBlk;                 ptr += 4;
+        for (u32 k = 0; k < chunkLen; ++k) *ptr++ = payload[dataOffset + k];
+
+        u32 payloadLen = (u32)(ptr - blkStart);
+        u32 c = crc32(blkStart, payloadLen);
+        *(u32*)ptr = c; ptr += 4;
+
+        u32 blkDataLen = (u32)(ptr - blkStart);
+        u16 eraseCount = (blockIdxs[b] < allocator->bam.size())
+                         ? allocator->bam[blockIdxs[b]].eraseCount : 0u;
+        device->writeBlock(blockIdxs[b], eraseCount, buf.slice(0, blkDataLen));
+        dataOffset += chunkLen;
+    }
+
+    BlobMeta meta;
+    meta.blockIdx = blockIdxs[0];
+    meta.offset = 0;
+    meta.length = totalLen;
+    meta.originalSize = origSize;
+    meta.fixedPosition = 0;
+    meta.ref = 0;
+    meta.frozen = false;
+    meta.used = false;
+    meta.isDiff = true;
+    meta.baseHash = baseHash;
+    meta.seq = 0;
     index.set(hash, meta);
     bloomInsert(hash);
     return true;
@@ -311,7 +535,7 @@ void BlobStore::scanFromDevice() {
         const u8* ptr = (const u8*)blockData.data();
         if (*ptr++ != (u8)BlockType::BLOB) continue;
         u8 isFirst = *ptr++;
-        if (!isFirst) continue; // Only index first-block entries
+        if (isFirst == 0) continue; // Only index first-block entries
 
         u8 keyLen = *ptr++;
         if (keyLen == 0 || keyLen > 200) continue;
@@ -319,11 +543,30 @@ void BlobStore::scanFromDevice() {
         String key; key.allocate(keyLen);
         for (u8 i = 0; i < keyLen; ++i) key[i] = *ptr++;
 
+        bool isDiff = (isFirst == 2);
+        String baseHash;
+        if (isDiff) {
+            u8 baseHashLen = *ptr++;
+            baseHash.allocate(baseHashLen);
+            for (u8 i = 0; i < baseHashLen; ++i) baseHash[i] = *ptr++;
+        }
+
         u32 totalDataLen = *(u32*)ptr; ptr += 4;
         /* u32 thisChunkLen = *(u32*)ptr; */ ptr += 4;
         /* u32 nextBlock    = *(u32*)ptr; */ ptr += 4;
 
-        BlobMeta meta = { b, 0, totalDataLen, totalDataLen, 0 };
+        BlobMeta meta;
+        meta.blockIdx = b;
+        meta.offset = 0;
+        meta.length = totalDataLen;
+        meta.originalSize = totalDataLen;
+        meta.fixedPosition = 0;
+        meta.ref = 0;
+        meta.frozen = false;
+        meta.used = false;
+        meta.isDiff = isDiff;
+        meta.baseHash = baseHash;
+        meta.seq = 0;
         index.set(key, meta);
     }
     bloomRebuild();
@@ -391,8 +634,14 @@ String BlobStore::readChain(u32 blockIdx) const {
     ptr++;                     // type
     u8 isF = *ptr++;
     u8 kLen = *ptr++;
-    if (!isF) return String(); // Must start with a first block
+    if (isF == 0) return String(); // Must start with a first block
     ptr += kLen;               // key
+    
+    if (isF == 2) {
+        u8 baseHashLen = *ptr++;
+        ptr += baseHashLen;    // skip baseHash
+    }
+    
     u32 totalLen = *(u32*)ptr; ptr += 4;
     u32 cLen = *(u32*)ptr; ptr += 4;
     u32 next = *(u32*)ptr; ptr += 4;

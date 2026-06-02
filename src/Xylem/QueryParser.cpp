@@ -83,101 +83,13 @@ Array<String> QueryParser::tokenize(const String& query, const Array<String>& ar
     return tokens;
 }
 
-Array<GraphOp> QueryParser::parseExtract(const String& pathStr, bool recursive) {
-    Array<GraphOp> ops;
-    if (pathStr.isEmpty()) return ops;
-
-    // Remove leading/trailing quotes if passed raw (though tokenizer strips quotes normally)
-    String p = pathStr;
-    if (p.startsWith("\"") && p.endsWith("\"")) p = p.slice(1, p.size() - 1);
-
-    Array<String> parts = p.split("/");
-    Array<String> cleanParts;
-    for (usz i = 0; i < parts.size(); ++i) {
-        if (!parts[i].isEmpty()) cleanParts.push(parts[i]);
-    }
-
-    if (cleanParts.size() == 0) {
-        // Root MATCH
-        GraphOp match;
-        match.type = GraphOpType::MATCH;
-        Clause rootParent;
-        rootParent.col = "parent_id";
-        rootParent.op = "=";
-        rootParent.val = "0";
-
-        Clauses group;
-        group.push(rootParent);
-        match.query.push(group);
-        ops.push(match);
-        return ops;
-    }
-
-    // Root MATCH
-    GraphOp match;
-    match.type = GraphOpType::MATCH;
-    Clause rootClause;
-    rootClause.col = "name";
-    rootClause.op = "=";
-    rootClause.val = cleanParts[0];
-    
-    // As per user instructions, parent_id=0 means no parent (root)
-    Clause rootParent;
-    rootParent.col = "parent_id";
-    rootParent.op = "=";
-    rootParent.val = "0";
-
-    Clauses group;
-    group.push(rootClause);
-    group.push(rootParent);
-    match.query.push(group);
-    ops.push(match);
-
-    // Subsequent FOLLOWs
-    for (usz i = 1; i < cleanParts.size(); ++i) {
-        GraphOp follow;
-        follow.type = GraphOpType::FOLLOW;
-        
-        Clause pId;
-        pId.col = "parent_id";
-        pId.op = "=";
-        pId.val = "parent.id";
-        
-        Clause pName;
-        pName.col = "name";
-        pName.op = "=";
-        pName.val = cleanParts[i];
-        
-        Clauses fGroup;
-        fGroup.push(pId);
-        fGroup.push(pName);
-        follow.query.push(fGroup);
-        ops.push(follow);
-    }
-
-    if (recursive) {
-        GraphOp repeatFollow;
-        repeatFollow.type = GraphOpType::REPEATFOLLOW;
-        Clause rfId;
-        rfId.col = "parent_id";
-        rfId.op = "=";
-        rfId.val = "parent.id";
-        Clauses rfGroup;
-        rfGroup.push(rfId);
-        repeatFollow.query.push(rfGroup);
-        ops.push(repeatFollow);
-    }
-
-    return ops;
-}
-
 static Clause parseClauseStr(const String& str) {
     Clause c;
     c.op = "=";
     // Look for operators
     Array<String> ops;
     ops.push("=="); ops.push("<="); ops.push(">="); ops.push("reg");
-    ops.push("cos"); ops.push("hash"); ops.push("="); ops.push("<"); ops.push(">");
+    ops.push("cos"); ops.push("hash"); ops.push("path"); ops.push("="); ops.push("<"); ops.push(">");
     for (const String& op : ops) {
         long long pos = str.indexOf(op);
         if (pos >= 0) {
@@ -191,6 +103,91 @@ static Clause parseClauseStr(const String& str) {
     c.col = str;
     c.val = "";
     return c;
+}
+
+static void parseClausesFromTokens(const Array<String>& tokens, usz& idx, Array<Clauses>& queryClauses) {
+    Clauses currentGroup;
+    bool inWhere = false;
+    bool inAssert = false;
+    
+    while (idx < tokens.size()) {
+        String t = tokens[idx];
+        String tu = t.toUpperCase();
+        
+        if (tu == "WHERE") {
+            if (currentGroup.size() > 0) {
+                currentGroup.isAssert = inAssert;
+                queryClauses.push(currentGroup);
+                currentGroup.clear();
+            }
+            inWhere = true;
+            inAssert = false;
+        } else if (tu == "ASSERT") {
+            if (currentGroup.size() > 0) {
+                currentGroup.isAssert = inAssert;
+                queryClauses.push(currentGroup);
+                currentGroup.clear();
+            }
+            inWhere = false;
+            inAssert = true;
+        } else if (tu == "OR") {
+            if (idx + 1 < tokens.size()) {
+                String nextTu = tokens[idx+1].toUpperCase();
+                if (nextTu == "WHERE") {
+                    if (currentGroup.size() > 0) {
+                        currentGroup.isAssert = inAssert;
+                        queryClauses.push(currentGroup);
+                        currentGroup.clear();
+                    }
+                    inWhere = true;
+                    inAssert = false;
+                    idx++;
+                } else if (nextTu == "ASSERT") {
+                    if (currentGroup.size() > 0) {
+                        currentGroup.isAssert = inAssert;
+                        queryClauses.push(currentGroup);
+                        currentGroup.clear();
+                    }
+                    inWhere = false;
+                    inAssert = true;
+                    idx++;
+                } else {
+                    break; // stop parsing clauses
+                }
+            } else {
+                break;
+            }
+        } else {
+            if (inWhere || inAssert) {
+                bool isThreeToken = false;
+                if (idx + 2 < tokens.size()) {
+                    String op = tokens[idx+1];
+                    if (op == "==" || op == "<=" || op == ">=" || op == "reg" ||
+                        op == "cos" || op == "hash" || op == "path" ||
+                        op == "=" || op == "<" || op == ">") {
+                        Clause c;
+                        c.col = tokens[idx];
+                        c.op = op;
+                        c.val = tokens[idx+2];
+                        currentGroup.push(c);
+                        idx += 2;
+                        isThreeToken = true;
+                    }
+                }
+                if (!isThreeToken) {
+                    currentGroup.push(parseClauseStr(t));
+                }
+            } else {
+                break; // Stop if not in WHERE/ASSERT
+            }
+        }
+        idx++;
+    }
+    
+    if (currentGroup.size() > 0) {
+        currentGroup.isAssert = inAssert;
+        queryClauses.push(currentGroup);
+    }
 }
 
 QueryResult QueryParser::execute(XylemEngine* engine, const String& queryStr, const Array<String>& args) {
@@ -311,100 +308,8 @@ QueryResult QueryParser::execute(XylemEngine* engine, const String& queryStr, co
         return res;
     }
 
-    // Graph Commands (GR, GW, VGW)
-    if (cmd == "GRAPHREAD" || cmd == "GR" ||
-        cmd == "GRAPHWRITE" || cmd == "GW" ||
-        cmd == "GRAPHWRITEVOLATILE" || cmd == "VGW") {
-        
-        bool isWrite = (cmd == "GRAPHWRITE" || cmd == "GW" || cmd == "GRAPHWRITEVOLATILE" || cmd == "VGW");
-        bool isVolatile = (cmd == "GRAPHWRITEVOLATILE" || cmd == "VGW");
-        
-        Array<GraphOp> ops;
-        Array<String> columns;
-        usz idx = 1;
-        
-        // Handle EXTRACT keyword
-        while (idx < tokens.size()) {
-            String t = tokens[idx];
-            String tu = t.toUpperCase();
-            
-            if (tu == "EXTRACT") {
-                idx++;
-                if (idx < tokens.size()) {
-                    Array<GraphOp> extOps = parseExtract(tokens[idx]);
-                    for(usz i=0; i<extOps.size(); ++i) ops.push(extOps[i]);
-                    idx++;
-                }
-            } else if (tu == "MATCH" || tu == "FOLLOW" || tu == "REPEATFOLLOW" || tu == "UNTIL" || (tu == "SET" && isWrite)) {
-                GraphOp op;
-                if (tu == "MATCH") op.type = GraphOpType::MATCH;
-                else if (tu == "FOLLOW") op.type = GraphOpType::FOLLOW;
-                else if (tu == "REPEATFOLLOW") op.type = GraphOpType::REPEATFOLLOW;
-                else if (tu == "UNTIL") op.type = GraphOpType::UNTIL;
-                else if (tu == "SET") op.type = GraphOpType::SET;
-                
-                idx++;
-                Clauses group;
-                while (idx < tokens.size()) {
-                    String t2 = tokens[idx].toUpperCase();
-                    if (t2 == "MATCH" || t2 == "FOLLOW" || t2 == "REPEATFOLLOW" || t2 == "UNTIL" || t2 == "SET" || t2 == "REMOVE" || t2 == "EXTRACT") {
-                        break;
-                    }
-                    if (t2 == "OR") {
-                        if (group.size() > 0) { op.query.push(group); group.clear(); }
-                        idx++; continue;
-                    }
-                    if (op.type == GraphOpType::SET) {
-                        op.writeSet.push(parseClauseStr(tokens[idx]));
-                    } else {
-                        group.push(parseClauseStr(tokens[idx]));
-                    }
-                    idx++;
-                }
-                if (group.size() > 0) op.query.push(group);
-                ops.push(op);
-            } else if (tu == "REMOVE" && isWrite) {
-                GraphOp op;
-                op.type = GraphOpType::REMOVE;
-                ops.push(op);
-                idx++;
-            } else if (!isWrite) {
-                // columns for read
-                columns.push(t);
-                idx++;
-            } else {
-                idx++;
-            }
-        }
-        
-        if (isWrite) {
-            for (usz i = 0; i < ops.size(); ++i) {
-                if (ops[i].type == GraphOpType::SET) {
-                    for (usz j = 0; j < ops[i].writeSet.size(); ++j) {
-                        if (ops[i].writeSet[j].col.endsWith(":generate")) {
-                            String baseCol = ops[i].writeSet[j].col.substring(0, ops[i].writeSet[j].col.size() - 9);
-                            ops[i].writeSet[j].col = baseCol;
-                            ops[i].writeSet[j].val = engine->generateId(baseCol);
-                        }
-                    }
-                }
-            }
-            if (isVolatile) {
-                res.code = engine->graphWriteVolatile(ops, 0, "");
-            } else {
-                res.code = engine->graphWrite(ops, 0, "");
-            }
-        } else {
-            res.treeResult = engine->graphRead(columns, ops, 0, 0);
-            res.code = (res.treeResult != nullptr) ? 0 : -1;
-        }
-        return res;
-    }
-
     if (cmd == "FREEZE" || cmd == "THAW") {
         Array<Clauses> queryClauses;
-        Clauses currentGroup;
-        bool inWhere = false;
         u64 freezePos = 0;
         usz idx = 1;
         
@@ -415,33 +320,7 @@ QueryResult QueryParser::execute(XylemEngine* engine, const String& queryStr, co
             }
         }
         
-        while (idx < tokens.size()) {
-            String t = tokens[idx];
-            String tu = t.toUpperCase();
-            if (tu == "WHERE") {
-                inWhere = true;
-                idx++;
-                if (idx < tokens.size()) {
-                    currentGroup.push(parseClauseStr(tokens[idx]));
-                }
-            } else if (tu == "OR") {
-                if (idx + 1 < tokens.size() && tokens[idx+1].toUpperCase() == "WHERE") {
-                    if (currentGroup.size() > 0) {
-                        queryClauses.push(currentGroup);
-                        currentGroup.clear();
-                    }
-                    inWhere = true;
-                    idx += 2;
-                    if (idx < tokens.size()) {
-                        currentGroup.push(parseClauseStr(tokens[idx]));
-                    }
-                }
-            } else {
-                if (inWhere) currentGroup.push(parseClauseStr(t));
-            }
-            idx++;
-        }
-        if (currentGroup.size() > 0) queryClauses.push(currentGroup);
+        parseClausesFromTokens(tokens, idx, queryClauses);
         
         Array<String> readCols;
         readCols.push("id");
@@ -471,11 +350,16 @@ QueryResult QueryParser::execute(XylemEngine* engine, const String& queryStr, co
     }
 
     if (cmd == "LOCK") {
-        bool req = false;
+        bool req = true;
         if (tokens.size() > 2 && tokens[1].toUpperCase() == "AS") {
             req = tokens[2] == "1" || tokens[2].toUpperCase() == "TRUE";
         }
         res.code = engine->lock(Array<Clauses>(), 0, req);
+        return res;
+    }
+
+    if (cmd == "COMMIT") {
+        res.code = engine->commit();
         return res;
     }
 
@@ -507,31 +391,8 @@ QueryResult QueryParser::execute(XylemEngine* engine, const String& queryStr, co
 
     if (cmd == "WATCH") {
         Array<Clauses> queryClauses;
-        Clauses currentGroup;
-        bool inWhere = false;
         usz idx = 1;
-        
-        while (idx < tokens.size()) {
-            String t = tokens[idx];
-            String tu = t.toUpperCase();
-            if (tu == "WHERE") {
-                inWhere = true;
-                idx++;
-                if (idx < tokens.size()) currentGroup.push(parseClauseStr(tokens[idx]));
-            } else if (tu == "OR") {
-                if (idx + 1 < tokens.size() && tokens[idx+1].toUpperCase() == "WHERE") {
-                    if (currentGroup.size() > 0) { queryClauses.push(currentGroup); currentGroup.clear(); }
-                    inWhere = true;
-                    idx += 2;
-                    if (idx < tokens.size()) currentGroup.push(parseClauseStr(tokens[idx]));
-                }
-            } else {
-                if (inWhere) currentGroup.push(parseClauseStr(t));
-            }
-            idx++;
-        }
-        if (currentGroup.size() > 0) queryClauses.push(currentGroup);
-        
+        parseClausesFromTokens(tokens, idx, queryClauses);
         res.code = engine->watch(queryClauses);
         return res;
     }
@@ -541,49 +402,38 @@ QueryResult QueryParser::execute(XylemEngine* engine, const String& queryStr, co
         Array<String> columns;
         Array<Clause> writeCols;
         Array<Clauses> queryClauses;
-        Clauses currentGroup;
         
         usz idx = 1;
-        bool inWhere = false;
-        
         while (idx < tokens.size()) {
             String t = tokens[idx];
             String tu = t.toUpperCase();
-            
-            if (tu == "WHERE") {
-                inWhere = true;
-                idx++;
-                if (idx < tokens.size()) {
-                    currentGroup.push(parseClauseStr(tokens[idx]));
-                }
-            } else if (tu == "OR") {
-                if (idx + 1 < tokens.size() && tokens[idx+1].toUpperCase() == "WHERE") {
-                    if (currentGroup.size() > 0) {
-                        queryClauses.push(currentGroup);
-                        currentGroup.clear();
-                    }
-                    inWhere = true;
-                    idx += 2;
-                    if (idx < tokens.size()) {
-                        currentGroup.push(parseClauseStr(tokens[idx]));
-                    }
-                } else {
-                    // Invalid OR
-                }
+            if (tu == "WHERE" || tu == "ASSERT") {
+                break;
+            }
+            if (cmd == "READ") {
+                columns.push(t);
             } else {
-                if (inWhere) {
-                    currentGroup.push(parseClauseStr(t));
-                } else {
-                    if (cmd == "READ") columns.push(t);
-                    else writeCols.push(parseClauseStr(t));
+                bool isThreeToken = false;
+                if (idx + 2 < tokens.size()) {
+                    String op = tokens[idx+1];
+                    if (op == "=") {
+                        Clause c;
+                        c.col = tokens[idx];
+                        c.op = op;
+                        c.val = tokens[idx+2];
+                        writeCols.push(c);
+                        idx += 2;
+                        isThreeToken = true;
+                    }
+                }
+                if (!isThreeToken) {
+                    writeCols.push(parseClauseStr(t));
                 }
             }
             idx++;
         }
         
-        if (currentGroup.size() > 0) {
-            queryClauses.push(currentGroup);
-        }
+        parseClausesFromTokens(tokens, idx, queryClauses);
         
         if (cmd == "READ") {
             res.readRows = engine->read(columns, queryClauses);

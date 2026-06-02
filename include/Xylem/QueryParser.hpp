@@ -24,7 +24,7 @@ public:
 
     // Visible for testing or internal composition
     static Collection::Array<Collection::String> tokenize(const Collection::String& query, const Collection::Array<Collection::String>& args);
-    static Collection::Array<GraphOp> parseExtract(const Collection::String& pathStr, bool recursive = true);
+
 };
 
 } // namespace Xylem

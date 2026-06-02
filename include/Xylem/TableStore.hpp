@@ -38,6 +38,32 @@ public:
     }
 };
 
+class BloomFilter {
+public:
+    Array<u8> bits;
+    usz numBits;
+    
+    BloomFilter(usz numBits = 1024) : numBits(numBits) {
+        bits.allocate((numBits + 7) / 8);
+        for (usz i = 0; i < bits.size(); ++i) bits[i] = 0;
+    }
+    
+    void add(const String& item) {
+        u32 h1 = crc32(item);
+        u32 h2 = h1 ^ 0x5bd1e995;
+        bits[(h1 % numBits) / 8] |= (1 << ((h1 % numBits) % 8));
+        bits[(h2 % numBits) / 8] |= (1 << ((h2 % numBits) % 8));
+    }
+    
+    bool contains(const String& item) const {
+        u32 h1 = crc32(item);
+        u32 h2 = h1 ^ 0x5bd1e995;
+        if ((bits[(h1 % numBits) / 8] & (1 << ((h1 % numBits) % 8))) == 0) return false;
+        if ((bits[(h2 % numBits) / 8] & (1 << ((h2 % numBits) % 8))) == 0) return false;
+        return true;
+    }
+};
+
 class TableStore {
 public:
     BlockDevice* device;
@@ -89,6 +115,7 @@ public:
     u64 currentSeq = 0; // Mirrors journal sequence
 
     TableStore(BlockDevice* dev, Allocator* alloc, Array<String>* keys = nullptr);
+    ~TableStore();
 
     void loadSchemas();
     void saveSchemas();
@@ -105,12 +132,12 @@ public:
               const String& encryptionKey = "", u64 txId = 0, bool isVolatile = false);
     bool remove(const Array<Clauses>& clauses, u64 length = 0);
     
-    Collection::TreeBranch* graphRead(const Array<String>& columns, const Array<GraphOp>& ops,
-                                       u64 limit = 0, u64 snapshotSeq = 0, u64 txId = 0);
-    int graphWrite(const Array<GraphOp>& ops, const String& encryptionKey = "", u64 txId = 0, bool isVolatile = false);
+    f32 evaluateClauses(const Map<String, String>& row, const Array<Clauses>& clausesGroups, const Map<String, String>* parentRow = nullptr, u64 rId = 0);
+    f32 evaluateClause(const Map<String, String>& row, const Clause& clause, const Map<String, String>* parentRow = nullptr, u64 rId = 0);
 
-    f32 evaluateClauses(const Map<String, String>& row, const Array<Clauses>& clausesGroups, const Map<String, String>* parentRow = nullptr);
-    f32 evaluateClause(const Map<String, String>& row, const Clause& clause, const Map<String, String>* parentRow = nullptr);
+    Array<u64> resolvePathPattern(const String& colName, const String& pathPattern, u64 snapshotSeq, u64 txId);
+    void resolvePathsInClauses(const Array<Clauses>& clauses, u64 snapshotSeq, u64 txId);
+    void rebuildBloomFilters();
 
     void updateLru(u64 id);
     void evictIfNeeded();
@@ -155,6 +182,9 @@ public:
     // Key: column name → Map of (value → Array of row IDs)
     Map<String, Map<String, Array<u64>>> colHashIndex;
     bool colHashIndexDirty = true; // Mark dirty on any write/remove
+    bool colBloomFiltersDirty = true;
+    Map<String, BloomFilter*> colBloomFilters;
+    Map<String, Array<u64>> precomputedPaths;
     bool disableIndex = false;
 
     void rebuildColHashIndex();

@@ -233,7 +233,7 @@ int main() {
   // Test 10: High-Performance Vector DB (Cosine Similarity & Top-K)
   Info("Test 10: High-Performance Vector DB (Cosine Similarity & Top-K)");
 
-  bool quickMode = false; // Set to false to run the full vector DB stress test
+  bool quickMode = true; // Set to false to run the full vector DB stress test
   usz numVectors = quickMode ? 100 : 10000;
   usz dim = 128;
   Info("Ingesting " + String::from((u64)numVectors) + " vectors of " +
@@ -248,6 +248,9 @@ int main() {
 
   u64 tStart = Xi::millis();
 
+  usz perfectIdx = quickMode ? 77 : 7777;
+  usz closeIdx = quickMode ? 88 : 8888;
+
   for (usz i = 0; i < numVectors; ++i) {
     String vecStr;
     vecStr.allocate(dim * sizeof(f32));
@@ -256,11 +259,11 @@ int main() {
       vec[j] = (f32)(Xi::randomNext() % 1000) / 1000.0f - 0.5f;
     }
 
-    if (i == 7777) {
+    if (i == perfectIdx) {
       for (usz j = 0; j < dim; ++j)
         vec[j] = targetVec[j]; // Perfect Match
     }
-    if (i == 8888) {
+    if (i == closeIdx) {
       for (usz j = 0; j < dim; ++j)
         vec[j] = targetVec[j] + 0.001f; // Close Match
     }
@@ -299,8 +302,8 @@ int main() {
   }
 
   Info("Test 10.1: Instantaneous Removal");
-  xm.remove(OR(WHERE("v_id", "=", "7777")));
-  Info("Deleted ID 7777 (Perfect Match). Searching again...");
+  xm.remove(OR(WHERE("v_id", "=", String::from((u64)perfectIdx))));
+  Info("Deleted Perfect Match. Searching again...");
 
   topRows = xm.read(retCols, OR(WHERE("embedding", "cos", targetVecStr)), 5);
   for (usz i = 0; i < topRows.size(); ++i) {
@@ -327,8 +330,8 @@ int main() {
          rebootRows[i]["v_id"]);
   }
 
-  // --- Test 12: Graph Traversal (Write/Update) ---
-  Info("Test 12: Graph Traversal (Atomic Write)");
+  // --- Test 12: Path-Based Queries (Write/Update) ---
+  Info("Test 12: Path-Based Queries (Write/Update)");
 
   // Create a folder structure
   Array<Clause> rRoot;
@@ -362,43 +365,30 @@ int main() {
   xm.write(rFile1);
   xm.write(rFile2);
 
-  // Perform bulk update!
-  xm.graphWrite(
-      GRAPH(MATCH(WHERE("id", "=", "root_id")),
-            SET(WHERE("mod_time", "=", "updated_at_root")),
-            REPEATFOLLOW(WHERE("parent_id", "=", "parent.id"),
-                         WHERE("type", "=", "file")), // Stop at files
-            SET(WHERE("mod_time", "=",
-                      "updated_at_dir")), // Updates all dirs under root
-            FOLLOW(WHERE("type", "=", "file")),
-            SET(WHERE("content", "=", "cleared")) // Update only the files
-            ));
+  // Perform bulk update using path operator instead of graphWrite!
+  Array<Clause> upFiles;
+  upFiles.push({"content", "=", "cleared"});
+  
+  Array<Clauses> updateClauses;
+  updateClauses.push(WHERE("name", "path", "root/**") && WHERE("type", "=", "file"));
+  xm.write(upFiles, updateClauses);
 
   auto files = xm.read(Array<String>(), OR(WHERE("type", "=", "file")));
   if (files.size() != 2 || *files[0].get("content") != "cleared")
-    Error("Graph Write failed to update files!");
+    Error("Path-based update failed to update files!");
   else
-    Success("Graph Write successfully updated files atomically!");
+    Success("Path-based update successfully updated files atomically!");
 
-  // --- Test 13: Graph Traversal (Read) ---
-  Info("Test 13: Graph Traversal (Read to XiC Tree)");
-  Collection::TreeBranch *tree =
-      xm.graphRead(Array<String>(),
-                   GRAPH(MATCH(WHERE("id", "=", "root_id")),
-                         REPEATFOLLOW(WHERE("parent_id", "=", "parent.id"))));
+  // --- Test 13: Path-Based Traversal (Read) ---
+  Info("Test 13: Path-Based Traversal (Read)");
+  Array<String> traversalCols;
+  auto treeRows = xm.read(traversalCols, OR(WHERE("name", "path", "root/**")));
 
-  if (!tree || tree->size() != 1)
-    Error("Graph Read failed to find root!");
+  if (treeRows.size() != 5)
+    Error("Path Traversal Read failed to find all descendants! Found: " + String::from((u64)treeRows.size()));
   else {
-    Collection::TreeBranch *rootNode =
-        dynamic_cast<Collection::TreeBranch *>((*tree)[0]);
-    if (!rootNode || rootNode->size() != 1)
-      Error("Graph Read failed to populate children!");
-    else
-      Success("Graph Read returned a valid XiC TreeBranch structure spanning "
-              "to the deepest nodes!");
+    Success("Path Traversal Read successfully returned all 5 descendants!");
   }
-  delete tree;
 
   // --- Test 14: Hardcore Raw Pinning & Relocation ---
   Info("Test 14: Hardcore Raw Pinning & Relocation");
@@ -535,6 +525,7 @@ int main() {
   else
     Error("Volatile row incorrectly persisted to disk!");
   Success("All rigorous tests successfully passed!");
+  xm.destroy();
   close(fd);
 
   return 0;

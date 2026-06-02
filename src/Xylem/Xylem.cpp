@@ -842,46 +842,6 @@ int XylemEngine::writeVolatile(const Array<Clause>& columns, const Array<Clauses
     return result;
 }
 
-Collection::TreeBranch* XylemEngine::graphRead(const Array<String>& columns, const Array<GraphOp>& ops,
-                                                u64 limit, u64 txId) {
-    ensureMounted();
-    if (!tableStore) return nullptr;
-    u64 snapshotSeq = 0;
-    if (txId != 0 && journal) {
-        auto* ls = journal->activeLocks.get(txId);
-        if (ls) snapshotSeq = ls->snapshotSeq;
-    }
-    return tableStore->graphRead(columns, ops, limit, snapshotSeq, txId);
-}
-
-int XylemEngine::graphWrite(const Array<GraphOp>& ops, u64 txId, const String& encryptionKey) {
-    ensureMounted();
-    if (isWriteBlocked(txId)) return -1;
-    if (txId != 0) {
-        if (!tableStore) return -1;
-        int r = tableStore->graphWrite(ops, encryptionKey, txId);
-        if (r == 0) {
-            String payload = Journal::serializeGraphWrite(ops, encryptionKey);
-            journal->lockAppend(txId, JournalOpType::ROW_WRITE, 0, payload);
-        }
-        return r;
-    }
-    int r = tableStore ? tableStore->graphWrite(ops, encryptionKey) : -1;
-    if (r == 0) {
-        String payload = Journal::serializeGraphWrite(ops, encryptionKey);
-        journal->append(JournalOpType::ROW_WRITE, 0, payload); // Using ROW_WRITE enum to represent GRAPH_WRITE
-        if (payload.size() > 4000 || journal->isNearingCapacity()) flush();
-    }
-    return r;
-}
-
-int XylemEngine::graphWriteVolatile(const Array<GraphOp>& ops, u64 txId, const String& encryptionKey) {
-    ensureMounted();
-    if (isWriteBlocked(txId)) return -1;
-    int r = tableStore->graphWrite(ops, encryptionKey, 0, true);
-    // Volatile writes don't get logged to Journal or flushed immediately
-    return r;
-}
 
 bool XylemEngine::remove(const Array<Clauses>& clauses, u64 length, u64 as) {
     ensureMounted();
@@ -920,6 +880,10 @@ u64 XylemEngine::lock(const Array<Clauses>& clauses, u64 /*id*/, bool requiresEx
     return txId;
 }
 
+u64 XylemEngine::commit(const Array<Clauses>& clauses, u64 id) {
+    return lock(clauses, id, false);
+}
+
 bool XylemEngine::rollback(u64 id) {
     return journal ? journal->lockRollback(id) : false;
 }
@@ -956,10 +920,29 @@ int XylemEngine::unlock(u64 id) {
     if (tableStore) {
         u64 oldest = journal->oldestActiveSnapshot();
         tableStore->gcVersions(oldest);
+        mergeUnusedDiffs();
     }
     flush();
 
     return 0;
+}
+
+void XylemEngine::mergeUnusedDiffs() {
+    if (!blobStore || !tableStore || !journal) return;
+    u64 oldest = journal->oldestActiveSnapshot();
+    Array<String> toRemove;
+    for (auto it = blobStore->index.begin(); it != blobStore->index.end(); ++it) {
+        if (it->value.isDiff) {
+            bool isReferenced = tableStore->blobRefCounts.has(it->key) && (*tableStore->blobRefCounts.get(it->key) > 0);
+            bool neededByActiveTx = (it->value.seq >= oldest);
+            if (!isReferenced && !neededByActiveTx) {
+                toRemove.push(it->key);
+            }
+        }
+    }
+    for (usz i = 0; i < toRemove.size(); ++i) {
+        blobStore->removeHash(toRemove[i]);
+    }
 }
 
 // ─── Blob API ─────────────────────────────────────────────────────────────────
@@ -1165,6 +1148,7 @@ void XylemEngine::vaccum() {
     if (journal && tableStore) {
         u64 oldest = journal->oldestActiveSnapshot();
         tableStore->gcVersions(oldest);
+        mergeUnusedDiffs();
     }
     allocator->saveBam();
 }
@@ -1245,6 +1229,7 @@ bool XylemEngine::vaccum(u64 startPos, u64 endPos) {
     if (journal && tableStore) {
         u64 oldest = journal->oldestActiveSnapshot();
         tableStore->gcVersions(oldest);
+        mergeUnusedDiffs();
     }
     allocator->buildHeap();
     allocator->saveBam();
@@ -1300,80 +1285,127 @@ bool XylemEngine::freeze(u64 startPos, const String& data) {
 
 QueryResult XylemEngine::cat(const String& path, u64 start, u64 end) {
     ensureMounted();
-    // Resolve path to get the content column
-    Array<GraphOp> ops = QueryParser::parseExtract(path, false);
-    if (ops.size() == 0) return QueryResult();
-
-    Collection::TreeBranch* tree = graphRead(Array<String>(), ops, 0, 0);
     QueryResult res;
-    if (!tree || tree->size() == 0) {
+    
+    String normPath = path;
+    if (normPath.endsWith("/") && normPath.size() > 1) {
+        normPath = normPath.slice(0, normPath.size() - 1);
+    }
+    
+    Array<String> cols;
+    cols.push("content");
+    
+    Array<Clauses> queryClauses;
+    queryClauses.push(WHERE("name", "path", normPath));
+    
+    auto rows = read(cols, queryClauses);
+    if (rows.size() > 0 && rows[0].has("content")) {
+        String content = *rows[0].get("content");
+        if (start > 0 || end > 0) {
+            u64 s = start;
+            u64 e = (end > 0) ? end : (u64)content.size();
+            if (e > (u64)content.size()) e = (u64)content.size();
+            if (s < e) content = content.slice((usz)s, (usz)e);
+            else content = "";
+        }
+        Map<String, String> row;
+        row.set("content", content);
+        res.readRows.push(row);
+        res.code = 0;
+    } else {
         res.code = -1;
-        if (tree) delete tree;
-        return res;
     }
-
-    // Navigate to deepest node to get content
-    Collection::TreeItem* item = (*tree)[0];
-    while (item) {
-        RowNode* rn = dynamic_cast<RowNode*>(item);
-        if (rn) {
-            if (rn->size() > 0) {
-                item = (*rn)[0];
-                continue;
-            }
-            // Found leaf
-            if (rn->row.has("content")) {
-                String content = *rn->row.get("content");
-                if (start > 0 || end > 0) {
-                    u64 s = start;
-                    u64 e = (end > 0) ? end : (u64)content.size();
-                    if (e > (u64)content.size()) e = (u64)content.size();
-                    if (s < e) content = content.slice((usz)s, (usz)e);
-                    else content = "";
-                }
-                Map<String, String> row;
-                row.set("content", content);
-                res.readRows.push(row);
-            }
-            break;
-        }
-        Collection::TreeBranch* tb = dynamic_cast<Collection::TreeBranch*>(item);
-        if (tb && tb->size() > 0) {
-            item = (*tb)[0];
-        } else {
-            break;
-        }
-    }
-    res.code = res.readRows.size() > 0 ? 0 : -1;
-    delete tree;
     return res;
 }
 
 QueryResult XylemEngine::tee(const String& path, const String& content, u64 start, u64 end) {
     ensureMounted();
-    // Parse path into parts
-    Array<String> parts = path.split("/");
-    Array<String> cleanParts;
-    for (usz i = 0; i < parts.size(); ++i) {
-        if (!parts[i].isEmpty()) cleanParts.push(parts[i]);
-    }
-    if (cleanParts.size() == 0) return QueryResult();
-
-    // Build graph ops: create directories as needed, then set content
-    Array<GraphOp> ops = QueryParser::parseExtract(path, false);
-
-    // Add SET op with content
-    GraphOp setOp;
-    setOp.type = GraphOpType::SET;
-    Clause contentClause;
-    contentClause.col = "content:blob";
-    contentClause.op = "=";
-    contentClause.val = content;
-    setOp.writeSet.push(contentClause);
-    ops.push(setOp);
-
     QueryResult res;
-    res.code = graphWrite(ops, 0, "");
+    
+    String normPath = path;
+    if (normPath.endsWith("/") && normPath.size() > 1) {
+        normPath = normPath.slice(0, normPath.size() - 1);
+    }
+    
+    // 1. Check if the path already exists
+    Array<String> readCols;
+    readCols.push("id");
+    readCols.push("type");
+    Array<Clauses> readClauses;
+    readClauses.push(WHERE("name", "path", normPath));
+    auto rows = read(readCols, readClauses);
+    
+    if (rows.size() > 0 && rows[0].has("id")) {
+        // Path exists. Update it.
+        String existingId = *rows[0].get("id");
+        
+        Array<Clause> writeCols;
+        String colName = (content.size() > 512) ? "content:blob" : "content";
+        if (start > 0 || end > 0) {
+            colName += "[" + String::from((long long)start) + ":" + String::from((long long)end) + "]";
+        }
+        writeCols.push({colName, "=", content});
+        
+        Array<Clauses> writeClauses;
+        writeClauses.push(WHERE("id", "=", existingId));
+        
+        res.code = write(writeCols, writeClauses);
+    } else {
+        // Path does not exist. Create directories and file.
+        Array<String> parts = normPath.split("/");
+        Array<String> cleanParts;
+        for (usz i = 0; i < parts.size(); ++i) {
+            if (!parts[i].isEmpty()) cleanParts.push(parts[i]);
+        }
+        if (cleanParts.size() == 0) return QueryResult();
+        
+        String currentParentId = "0";
+        String currentPathStr = "";
+        
+        // Traverse down the directories and create them if missing
+        for (usz i = 0; i < cleanParts.size() - 1; ++i) {
+            currentPathStr += "/" + cleanParts[i];
+            
+            // Check if this dir path exists
+            Array<Clauses> dirClauses;
+            dirClauses.push(WHERE("name", "path", currentPathStr));
+            auto dirRows = read(readCols, dirClauses);
+            
+            if (dirRows.size() > 0 && dirRows[0].has("id")) {
+                currentParentId = *dirRows[0].get("id");
+            } else {
+                u64 rnd = ((u64)Xi::randomNext() << 32) | Xi::randomNext();
+                String newId(rnd);
+                
+                Array<Clause> dirCols;
+                dirCols.push({"name", "=", cleanParts[i]});
+                dirCols.push({"parent_id", "=", currentParentId});
+                dirCols.push({"id", "=", newId});
+                dirCols.push({"type", "=", "dir"});
+                dirCols.push({"perms", "=", "755"});
+                
+                write(dirCols);
+                currentParentId = newId;
+            }
+        }
+        
+        // Create the file itself
+        u64 rnd = ((u64)Xi::randomNext() << 32) | Xi::randomNext();
+        String fileId(rnd);
+        
+        Array<Clause> fileCols;
+        fileCols.push({"name", "=", cleanParts[cleanParts.size() - 1]});
+        fileCols.push({"parent_id", "=", currentParentId});
+        fileCols.push({"id", "=", fileId});
+        fileCols.push({"type", "=", "file"});
+        fileCols.push({"perms", "=", "644"});
+        
+        String colName = (content.size() > 512) ? "content:blob" : "content";
+        fileCols.push({colName, "=", content});
+        
+        res.code = write(fileCols);
+    }
+    
     flush();
     return res;
 }
@@ -1381,41 +1413,33 @@ QueryResult XylemEngine::tee(const String& path, const String& content, u64 star
 QueryResult XylemEngine::ls(const String& path) {
     ensureMounted();
     QueryResult res;
-
-    if (path.isEmpty() || path == "/") {
-        Array<String> lsCols; lsCols.push("id"); lsCols.push("name"); lsCols.push("parent_id"); lsCols.push("type"); lsCols.push("perms");
-        Array<Clauses> lsWhere; lsWhere.push(WHERE("parent_id", "=", "0"));
-        res.readRows = read(lsCols, lsWhere);
-    } else {
-        // Resolve path to get parent id, then list children
-        Array<GraphOp> ops = QueryParser::parseExtract(path, false);
-        Array<String> idCols; idCols.push("id");
-        Collection::TreeBranch* tree = graphRead(idCols, ops, 0, 0);
-        if (tree && tree->size() > 0) {
-            // Get id of deepest matched node
-            Collection::TreeItem* item = (*tree)[0];
-            String dirId;
-            while (item) {
-                RowNode* rn = dynamic_cast<RowNode*>(item);
-                if (rn) {
-                    if (rn->size() > 0) {
-                        item = (*rn)[0];
-                        continue;
-                    }
-                    if (rn->row.has("id")) dirId = *rn->row.get("id");
-                    break;
-                }
-                Collection::TreeBranch* tb = dynamic_cast<Collection::TreeBranch*>(item);
-                if (tb && tb->size() > 0) { item = (*tb)[0]; } else { break; }
-            }
-            if (!dirId.isEmpty()) {
-                Array<String> lsCols2; lsCols2.push("id"); lsCols2.push("name"); lsCols2.push("parent_id"); lsCols2.push("type"); lsCols2.push("perms");
-                Array<Clauses> lsWhere2; lsWhere2.push(WHERE("parent_id", "=", dirId));
-                res.readRows = read(lsCols2, lsWhere2);
-            }
-            delete tree;
-        }
+    
+    String normPath = path;
+    if (normPath.endsWith("/") && normPath.size() > 1) {
+        normPath = normPath.slice(0, normPath.size() - 1);
     }
+    
+    String queryPath = normPath;
+    if (queryPath.isEmpty() || queryPath == "/") {
+        queryPath = "/*";
+    } else {
+        if (!queryPath.startsWith("/")) {
+            queryPath = "/" + queryPath;
+        }
+        queryPath = queryPath + "/*";
+    }
+    
+    Array<String> cols;
+    cols.push("id");
+    cols.push("name");
+    cols.push("parent_id");
+    cols.push("type");
+    cols.push("perms");
+    
+    Array<Clauses> queryClauses;
+    queryClauses.push(WHERE("name", "path", queryPath));
+    
+    res.readRows = read(cols, queryClauses);
     res.code = (int)res.readRows.size();
     return res;
 }
@@ -1423,48 +1447,16 @@ QueryResult XylemEngine::ls(const String& path) {
 bool XylemEngine::unlink(const String& path) {
     ensureMounted();
     if (!tableStore) return false;
-
-    // Resolve path
-    Array<String> parts = path.split("/");
-    Array<String> cleanParts;
-    for (usz i = 0; i < parts.size(); ++i) {
-        if (!parts[i].isEmpty()) cleanParts.push(parts[i]);
+    
+    String normPath = path;
+    if (normPath.endsWith("/") && normPath.size() > 1) {
+        normPath = normPath.slice(0, normPath.size() - 1);
     }
-    if (cleanParts.size() == 0) return false;
-
-    // Walk the path to find the item
-    String currentId = "0";
-    for (usz i = 0; i < cleanParts.size(); ++i) {
-        Array<String> idCols; idCols.push("id");
-        Array<Clauses> findWhere; findWhere.push(WHERE("parent_id", "=", currentId)
-                                  && WHERE("name", "=", cleanParts[i]));
-        auto rows = read(idCols, findWhere);
-        if (rows.size() == 0 || !rows[0].has("id")) return false;
-        currentId = *rows[0].get("id");
-    }
-
-    // Recursively remove children
-    Array<u64> stack;
-    // Parse currentId to u64
-    u64 targetId = 0;
-    for (usz i = 0; i < currentId.size(); ++i) {
-        if (currentId[i] >= '0' && currentId[i] <= '9')
-            targetId = targetId * 10 + (currentId[i] - '0');
-    }
-
-    // Remove children recursively
-    Array<String> childCols; childCols.push("id");
-    Array<Clauses> childWhere; childWhere.push(WHERE("parent_id", "=", currentId));
-    auto childRows = read(childCols, childWhere);
-    for (usz i = 0; i < childRows.size(); ++i) {
-        if (childRows[i].has("id")) {
-            unlink(path + "/" + *childRows[i].get("id"));
-        }
-    }
-
-    // Remove this item
-    Array<Clauses> removeWhere; removeWhere.push(WHERE("id", "=", currentId));
-    bool r = remove(removeWhere);
+    
+    Array<Clauses> queryClauses;
+    queryClauses.push(WHERE("name", "path", normPath + "/**"));
+    
+    bool r = remove(queryClauses);
     flush();
     return r;
 }
