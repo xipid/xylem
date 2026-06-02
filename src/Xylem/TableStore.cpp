@@ -1009,7 +1009,12 @@ int TableStore::write(const Array<Clause>& columns, const Array<Clauses>& clause
     };
 
     if (fastPathUsed) {
+        Array<u64> targets;
+        targets.reserve(candidateIds.size());
         for (u64 rId : candidateIds) {
+            targets.push(rId);
+        }
+        for (u64 rId : targets) {
             doUpdateRow(rId);
         }
     } else {
