@@ -354,7 +354,8 @@ String TableStore::applyBlobRange(const String& existingContent, const String& n
 
 void TableStore::rebuildColHashIndex() {
     colHashIndex.clear();
-    for (u64 rId : allRowIds) {
+    for (usz idx = 0; idx < allRowIds.size(); ++idx) {
+        u64 rId = allRowIds[idx];
         Map<String, String>* row = fetchRow(rId);
         if (!row) continue;
         for (auto it = row->begin(); it != row->end(); ++it) {
@@ -1669,6 +1670,11 @@ void TableStore::serializeBlock(u64 blockId, String& out, bool volatileOnly) {
     u32 tombstoneBytes = (rowCount + 7) / 8;
     for (u32 i = 0; i < tombstoneBytes; ++i) payload += (char)0;
     
+    // Write relative row IDs (offset from startId)
+    for (u32 i = 0; i < rowCount; ++i) {
+        writeVLU(payload, rowIds[i] - startId);
+    }
+    
     writeVLU(payload, colNames.size());
     
     for (usz c = 0; c < colNames.size(); ++c) {
@@ -1702,7 +1708,7 @@ void TableStore::serializeBlock(u64 blockId, String& out, bool volatileOnly) {
 
     out.clear();
     out += (char)BlockType::TABLE;
-    u16 tableId = 1;
+    u16 tableId = 1 | 0x8000; // Flag bit 15 to indicate new format with relative row IDs
     out += (char)(tableId & 0xFF); out += (char)((tableId >> 8) & 0xFF);
     writeVLU(out, startId);
     writeVLU(out, compressed.size());
@@ -1716,6 +1722,9 @@ void TableStore::deserializeBlock(u64 blockId, const String& in, bool isVolatile
     
     if (*ptr++ != (u8)BlockType::TABLE) return;
     u16 tableId = *ptr++; tableId |= ((u16)*ptr++ << 8);
+    
+    bool hasRelativeIds = (tableId & 0x8000) != 0;
+    tableId &= 0x7FFF;
     
     auto readVLU = [](const u8*& p, const u8* e) -> u64 {
         u64 val = 0; int shift = 0;
@@ -1755,21 +1764,32 @@ void TableStore::deserializeBlock(u64 blockId, const String& in, bool isVolatile
     u32 tombstoneBytes = (rowCount + 7) / 8;
     p += tombstoneBytes;
     
-    u64 numColumns = readVLU(p, pEnd);
-    
     Array<u64> rowIds;
     rowIds.allocate(rowCount);
     Map<u64, bool> existMap;
     for (usz j = 0; j < allRowIds.size(); ++j) {
         existMap.set(allRowIds[j], true);
     }
-    for (u32 i = 0; i < rowCount; ++i) {
-        rowIds[i] = rowStartIndex + i;
-        if (!existMap.has(rowIds[i])) {
-            allRowIds.push(rowIds[i]);
-            existMap.set(rowIds[i], true);
+    
+    if (hasRelativeIds) {
+        for (u32 i = 0; i < rowCount; ++i) {
+            rowIds[i] = rowStartIndex + readVLU(p, pEnd);
+            if (!existMap.has(rowIds[i])) {
+                allRowIds.push(rowIds[i]);
+                existMap.set(rowIds[i], true);
+            }
+        }
+    } else {
+        for (u32 i = 0; i < rowCount; ++i) {
+            rowIds[i] = rowStartIndex + i;
+            if (!existMap.has(rowIds[i])) {
+                allRowIds.push(rowIds[i]);
+                existMap.set(rowIds[i], true);
+            }
         }
     }
+    
+    u64 numColumns = readVLU(p, pEnd);
     
     Array<Map<String, String>> rows;
     rows.allocate(rowCount);

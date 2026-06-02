@@ -1301,7 +1301,7 @@ bool XylemEngine::freeze(u64 startPos, const String& data) {
 QueryResult XylemEngine::cat(const String& path, u64 start, u64 end) {
     ensureMounted();
     // Resolve path to get the content column
-    Array<GraphOp> ops = QueryParser::parseExtract(path);
+    Array<GraphOp> ops = QueryParser::parseExtract(path, false);
     if (ops.size() == 0) return QueryResult();
 
     Collection::TreeBranch* tree = graphRead(Array<String>(), ops, 0, 0);
@@ -1360,7 +1360,7 @@ QueryResult XylemEngine::tee(const String& path, const String& content, u64 star
     if (cleanParts.size() == 0) return QueryResult();
 
     // Build graph ops: create directories as needed, then set content
-    Array<GraphOp> ops = QueryParser::parseExtract(path);
+    Array<GraphOp> ops = QueryParser::parseExtract(path, false);
 
     // Add SET op with content
     GraphOp setOp;
@@ -1388,7 +1388,7 @@ QueryResult XylemEngine::ls(const String& path) {
         res.readRows = read(lsCols, lsWhere);
     } else {
         // Resolve path to get parent id, then list children
-        Array<GraphOp> ops = QueryParser::parseExtract(path);
+        Array<GraphOp> ops = QueryParser::parseExtract(path, false);
         Array<String> idCols; idCols.push("id");
         Collection::TreeBranch* tree = graphRead(idCols, ops, 0, 0);
         if (tree && tree->size() > 0) {

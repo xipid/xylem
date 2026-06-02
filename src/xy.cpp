@@ -1,6 +1,7 @@
 #include <Encoding/Yaml.hpp>
 #include <Sec/Crypto.hpp>
 #include <Terminal/Command.hpp>
+#include <Terminal/Format.hpp>
 #include <Xylem/Xylem.hpp>
 #include <fcntl.h>
 #include <filesystem>
@@ -430,6 +431,28 @@ int main(int argc, char **argv) {
       String linuxPath = tokens[1];
       String xylemPath = resolvePath(pwd, tokens[2]);
 
+      u64 totalFiles = 0;
+      u64 totalBytes = 0;
+      std::error_code ecSize;
+      std::filesystem::path lPathSize((const char *)linuxPath.data());
+
+      if (std::filesystem::is_directory(lPathSize, ecSize)) {
+        for (const auto &entry :
+             std::filesystem::recursive_directory_iterator(lPathSize, ecSize)) {
+          if (entry.is_regular_file(ecSize)) {
+            totalFiles++;
+            totalBytes += entry.file_size(ecSize);
+          }
+        }
+      } else if (std::filesystem::is_regular_file(lPathSize, ecSize)) {
+        totalFiles = 1;
+        totalBytes = std::filesystem::file_size(lPathSize, ecSize);
+      }
+
+      Progress progress;
+      usz taskIdx = progress.addLinearTask(totalBytes, "B", "Importing files");
+      progress.update();
+
       Map<String, String> dirCache;
       dirCache.set("0", "0");
       Array<String> newDirs;
@@ -588,12 +611,14 @@ int main(int argc, char **argv) {
           }
 
           txCount++;
-          if (txCount >= 500) {
+          if (txCount >= 50) {
             xm.unlock(txId);
             txId = xm.lock(Array<Clauses>(), 0, false);
             txCount = 0;
-            printf("IO: Synced %s to disk...\n", dstPath.data());
           }
+
+          progress.addLinearTaskDelta(taskIdx, size, "Importing " + fileName);
+          progress.update();
         } else {
           printf("Error: Failed to read file %s\n", srcPath.data());
         }
@@ -625,6 +650,9 @@ int main(int argc, char **argv) {
       if (txCount > 0)
         xm.unlock(txId);
       xm.flush();
+
+      progress.destroy();
+      Terminal::Success("Import complete: " + String::from((long long)totalFiles) + " files (" + String::from((long long)totalBytes) + " bytes) successfully imported.");
       continue;
     }
 
@@ -639,12 +667,50 @@ int main(int argc, char **argv) {
       String q = "GR EXTRACT \"" + xylemPath + "\"";
       QueryResult res = xm.query(q);
       if (res.treeResult && res.treeResult->size() > 0) {
+        struct ScanContext {
+          XylemEngine *xm;
+          u64 totalFiles = 0;
+          u64 totalBytes = 0;
+          void (*scan)(ScanContext *, const TreeItem *);
+        };
+        ScanContext sCtx;
+        sCtx.xm = &xm;
+        sCtx.scan = [](ScanContext *c, const TreeItem *node) {
+          if (!node) return;
+          const RowNode *rn = getDeepestRowNode(const_cast<TreeItem *>(node));
+          if (!rn) return;
+          String type = "";
+          if (rn->row.has("type"))
+            type = *rn->row.get("type");
+          if (type == "dir") {
+            for (usz i = 0; i < rn->size(); ++i) {
+              if ((*rn)[i]) c->scan(c, (*rn)[i]);
+            }
+          } else {
+            c->totalFiles++;
+            if (rn->row.has("content")) {
+              c->totalBytes += rn->row.get("content")->size();
+            } else if (rn->row.has("content:blob")) {
+              c->totalBytes += c->xm->getBlobSize(rn->row.get("content:blob")->toInt());
+            }
+          }
+        };
+        sCtx.scan(&sCtx, (*res.treeResult)[0]);
+
+        Progress progress;
+        usz taskIdx = progress.addLinearTask(sCtx.totalBytes, "B", "Extracting files");
+        progress.update();
+
         struct ExtractContext {
           XylemEngine *xm;
+          Progress *progress;
+          usz taskIdx;
           void (*extract)(ExtractContext *, const TreeItem *, const String &);
         };
         ExtractContext ctx;
         ctx.xm = &xm;
+        ctx.progress = &progress;
+        ctx.taskIdx = taskIdx;
         ctx.extract = [](ExtractContext *c, const TreeItem *node,
                          const String &lPath) {
           if (!node)
@@ -682,8 +748,17 @@ int main(int argc, char **argv) {
               std::ofstream file((const char *)lPath.data(), std::ios::binary);
               if (file.is_open()) {
                 file.write((const char *)content.data(), content.size());
-                printf("OI: Wrote %llu bytes to %s\n",
-                       (unsigned long long)content.size(), lPath.data());
+                String filename = lPath;
+                long long slash = -1;
+                for (long long i = (long long)lPath.length() - 1; i >= 0; --i) {
+                  if (lPath.charAt(i) == '/') {
+                    slash = i;
+                    break;
+                  }
+                }
+                if (slash >= 0) filename = lPath.substring(slash + 1);
+                c->progress->addLinearTaskDelta(c->taskIdx, content.size(), "Writing " + filename);
+                c->progress->update();
               } else {
                 printf("Error: Could not write to Linux file %s\n",
                        lPath.data());
@@ -694,6 +769,9 @@ int main(int argc, char **argv) {
           }
         };
         ctx.extract(&ctx, (*res.treeResult)[0], linuxPath);
+
+        progress.destroy();
+        Terminal::Success("Export complete: " + String::from((long long)sCtx.totalFiles) + " files (" + String::from((long long)sCtx.totalBytes) + " bytes) successfully exported.");
       } else {
         printf("Error: Xylem path not found.\n");
       }

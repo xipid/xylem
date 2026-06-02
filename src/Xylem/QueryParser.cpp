@@ -83,7 +83,7 @@ Array<String> QueryParser::tokenize(const String& query, const Array<String>& ar
     return tokens;
 }
 
-Array<GraphOp> QueryParser::parseExtract(const String& pathStr) {
+Array<GraphOp> QueryParser::parseExtract(const String& pathStr, bool recursive) {
     Array<GraphOp> ops;
     if (pathStr.isEmpty()) return ops;
 
@@ -155,16 +155,18 @@ Array<GraphOp> QueryParser::parseExtract(const String& pathStr) {
         ops.push(follow);
     }
 
-    GraphOp repeatFollow;
-    repeatFollow.type = GraphOpType::REPEATFOLLOW;
-    Clause rfId;
-    rfId.col = "parent_id";
-    rfId.op = "=";
-    rfId.val = "parent.id";
-    Clauses rfGroup;
-    rfGroup.push(rfId);
-    repeatFollow.query.push(rfGroup);
-    ops.push(repeatFollow);
+    if (recursive) {
+        GraphOp repeatFollow;
+        repeatFollow.type = GraphOpType::REPEATFOLLOW;
+        Clause rfId;
+        rfId.col = "parent_id";
+        rfId.op = "=";
+        rfId.val = "parent.id";
+        Clauses rfGroup;
+        rfGroup.push(rfId);
+        repeatFollow.query.push(rfGroup);
+        ops.push(repeatFollow);
+    }
 
     return ops;
 }
