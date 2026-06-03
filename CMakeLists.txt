@@ -29,6 +29,17 @@ message(STATUS "mold linker enabled")
 
 # Include the local 'xic' library from the sibling directory
 get_filename_component(XIC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../xic" ABSOLUTE)
+if(NOT EXISTS "${XIC_DIR}/CMakeLists.txt")
+    message(STATUS "xic not found at ${XIC_DIR}, downloading automatically...")
+    execute_process(
+        COMMAND git clone https://github.com/xipid/xic.git "${XIC_DIR}"
+        RESULT_VARIABLE CLONE_RESULT
+    )
+    if(NOT CLONE_RESULT EQUAL 0)
+        message(FATAL_ERROR "Failed to automatically download xic from https://github.com/xipid/xic.git")
+    endif()
+endif()
+
 if(EXISTS "${XIC_DIR}/CMakeLists.txt")
     message(STATUS "Found xic at ${XIC_DIR}")
     add_subdirectory(${XIC_DIR} ${CMAKE_CURRENT_BINARY_DIR}/xic)

@@ -109,6 +109,9 @@ static void parseClausesFromTokens(const Array<String>& tokens, usz& idx, Array<
     Clauses currentGroup;
     bool inWhere = false;
     bool inAssert = false;
+    bool inFollow = false;
+    bool inRepeatFollow = false;
+    bool nextIsOr = false;
     
     while (idx < tokens.size()) {
         String t = tokens[idx];
@@ -117,48 +120,108 @@ static void parseClausesFromTokens(const Array<String>& tokens, usz& idx, Array<
         if (tu == "WHERE") {
             if (currentGroup.size() > 0) {
                 currentGroup.isAssert = inAssert;
+                currentGroup.isFollow = inFollow;
+                currentGroup.isRepeatFollow = inRepeatFollow;
+                currentGroup.isOrConnection = nextIsOr;
                 queryClauses.push(currentGroup);
                 currentGroup.clear();
+                nextIsOr = false;
             }
             inWhere = true;
             inAssert = false;
+            inFollow = false;
+            inRepeatFollow = false;
         } else if (tu == "ASSERT") {
             if (currentGroup.size() > 0) {
                 currentGroup.isAssert = inAssert;
+                currentGroup.isFollow = inFollow;
+                currentGroup.isRepeatFollow = inRepeatFollow;
+                currentGroup.isOrConnection = nextIsOr;
                 queryClauses.push(currentGroup);
                 currentGroup.clear();
+                nextIsOr = false;
             }
             inWhere = false;
             inAssert = true;
+            inFollow = false;
+            inRepeatFollow = false;
+        } else if (tu == "FOLLOW") {
+            if (currentGroup.size() > 0) {
+                currentGroup.isAssert = inAssert;
+                currentGroup.isFollow = inFollow;
+                currentGroup.isRepeatFollow = inRepeatFollow;
+                currentGroup.isOrConnection = nextIsOr;
+                queryClauses.push(currentGroup);
+                currentGroup.clear();
+                nextIsOr = false;
+            }
+            inWhere = false;
+            inAssert = false;
+            inFollow = true;
+            inRepeatFollow = false;
+            if (idx + 1 < tokens.size() && tokens[idx+1].toUpperCase() == "WHERE") {
+                idx++;
+            }
+        } else if (tu == "REPEATFOLLOW") {
+            if (currentGroup.size() > 0) {
+                currentGroup.isAssert = inAssert;
+                currentGroup.isFollow = inFollow;
+                currentGroup.isRepeatFollow = inRepeatFollow;
+                currentGroup.isOrConnection = nextIsOr;
+                queryClauses.push(currentGroup);
+                currentGroup.clear();
+                nextIsOr = false;
+            }
+            inWhere = false;
+            inAssert = false;
+            inFollow = false;
+            inRepeatFollow = true;
+            if (idx + 1 < tokens.size() && tokens[idx+1].toUpperCase() == "WHERE") {
+                idx++;
+            }
         } else if (tu == "OR") {
+            bool hasNextKeyword = false;
+            String nextTu;
             if (idx + 1 < tokens.size()) {
-                String nextTu = tokens[idx+1].toUpperCase();
-                if (nextTu == "WHERE") {
-                    if (currentGroup.size() > 0) {
-                        currentGroup.isAssert = inAssert;
-                        queryClauses.push(currentGroup);
-                        currentGroup.clear();
+                nextTu = tokens[idx+1].toUpperCase();
+                if (nextTu == "WHERE" || nextTu == "ASSERT" || nextTu == "FOLLOW" || nextTu == "REPEATFOLLOW") {
+                    hasNextKeyword = true;
+                }
+            }
+            
+            if (hasNextKeyword) {
+                if (currentGroup.size() > 0) {
+                    currentGroup.isAssert = inAssert;
+                    currentGroup.isFollow = inFollow;
+                    currentGroup.isRepeatFollow = inRepeatFollow;
+                    currentGroup.isOrConnection = nextIsOr;
+                    queryClauses.push(currentGroup);
+                    currentGroup.clear();
+                }
+                inWhere = (nextTu == "WHERE");
+                inAssert = (nextTu == "ASSERT");
+                inFollow = (nextTu == "FOLLOW");
+                inRepeatFollow = (nextTu == "REPEATFOLLOW");
+                nextIsOr = true;
+                idx++;
+                if (nextTu == "FOLLOW" || nextTu == "REPEATFOLLOW") {
+                    if (idx + 1 < tokens.size() && tokens[idx+1].toUpperCase() == "WHERE") {
+                        idx++;
                     }
-                    inWhere = true;
-                    inAssert = false;
-                    idx++;
-                } else if (nextTu == "ASSERT") {
-                    if (currentGroup.size() > 0) {
-                        currentGroup.isAssert = inAssert;
-                        queryClauses.push(currentGroup);
-                        currentGroup.clear();
-                    }
-                    inWhere = false;
-                    inAssert = true;
-                    idx++;
-                } else {
-                    break; // stop parsing clauses
                 }
             } else {
-                break;
+                if (currentGroup.size() > 0) {
+                    currentGroup.isAssert = inAssert;
+                    currentGroup.isFollow = inFollow;
+                    currentGroup.isRepeatFollow = inRepeatFollow;
+                    currentGroup.isOrConnection = nextIsOr;
+                    queryClauses.push(currentGroup);
+                    currentGroup.clear();
+                }
+                nextIsOr = true;
             }
         } else {
-            if (inWhere || inAssert) {
+            if (inWhere || inAssert || inFollow || inRepeatFollow) {
                 bool isThreeToken = false;
                 if (idx + 2 < tokens.size()) {
                     String op = tokens[idx+1];
@@ -178,7 +241,7 @@ static void parseClausesFromTokens(const Array<String>& tokens, usz& idx, Array<
                     currentGroup.push(parseClauseStr(t));
                 }
             } else {
-                break; // Stop if not in WHERE/ASSERT
+                break;
             }
         }
         idx++;
@@ -186,6 +249,9 @@ static void parseClausesFromTokens(const Array<String>& tokens, usz& idx, Array<
     
     if (currentGroup.size() > 0) {
         currentGroup.isAssert = inAssert;
+        currentGroup.isFollow = inFollow;
+        currentGroup.isRepeatFollow = inRepeatFollow;
+        currentGroup.isOrConnection = nextIsOr;
         queryClauses.push(currentGroup);
     }
 }
@@ -398,7 +464,9 @@ QueryResult QueryParser::execute(XylemEngine* engine, const String& queryStr, co
     }
 
     // Standard CRUD (READ, WRITE, WRITEVOLATILE, REMOVE)
-    if (cmd == "READ" || cmd == "WRITE" || cmd == "WRITEVOLATILE" || cmd == "REMOVE") {
+    bool isRead = (cmd == "READ" || cmd == "READ*");
+    if (isRead || cmd == "WRITE" || cmd == "WRITEVOLATILE" || cmd == "REMOVE") {
+        bool readAllColumns = (cmd == "READ*");
         Array<String> columns;
         Array<Clause> writeCols;
         Array<Clauses> queryClauses;
@@ -407,10 +475,10 @@ QueryResult QueryParser::execute(XylemEngine* engine, const String& queryStr, co
         while (idx < tokens.size()) {
             String t = tokens[idx];
             String tu = t.toUpperCase();
-            if (tu == "WHERE" || tu == "ASSERT") {
+            if (tu == "WHERE" || tu == "ASSERT" || tu == "FOLLOW" || tu == "REPEATFOLLOW") {
                 break;
             }
-            if (cmd == "READ") {
+            if (isRead) {
                 columns.push(t);
             } else {
                 bool isThreeToken = false;
@@ -432,11 +500,15 @@ QueryResult QueryParser::execute(XylemEngine* engine, const String& queryStr, co
             }
             idx++;
         }
+
+        if (cmd == "READ" && columns.size() == 0) {
+            readAllColumns = true;
+        }
         
         parseClausesFromTokens(tokens, idx, queryClauses);
         
-        if (cmd == "READ") {
-            res.readRows = engine->read(columns, queryClauses);
+        if (isRead) {
+            res.readRows = engine->read(columns, queryClauses, 0, false, 0, readAllColumns);
             res.code = res.readRows.size();
         } else if (cmd == "WRITE" || cmd == "WRITEVOLATILE") {
             for (usz i = 0; i < writeCols.size(); ++i) {

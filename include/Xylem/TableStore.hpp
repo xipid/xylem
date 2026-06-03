@@ -79,6 +79,7 @@ public:
     u64 nextRowId = 1;
     Map<u64, Map<String, String>> allRows;
     Array<u64> allRowIds;
+    Map<u64, bool> allRowIdsMap;
     
     struct LruNode {
         u64 id;
@@ -126,11 +127,14 @@ public:
 
     Array<Map<String, String>> read(const Array<String>& columns, const Array<Clauses>& clauses,
                                      u64 length = 0, bool tombstones = false,
-                                     u64 snapshotSeq = 0, u64 txId = 0);
+                                     u64 snapshotSeq = 0, u64 txId = 0,
+                                     bool readAllColumns = false);
     
     int write(const Array<Clause>& columns, const Array<Clauses>& clauses = Array<Clauses>(),
               const String& encryptionKey = "", u64 txId = 0, bool isVolatile = false);
     bool remove(const Array<Clauses>& clauses, u64 length = 0);
+
+    Array<u64> getMatchingRowIds(const Array<Clauses>& clauses, u64 snapshotSeq, u64 txId);
     
     f32 evaluateClauses(const Map<String, String>& row, const Array<Clauses>& clausesGroups, const Map<String, String>* parentRow = nullptr, u64 rId = 0);
     f32 evaluateClause(const Map<String, String>& row, const Clause& clause, const Map<String, String>* parentRow = nullptr, u64 rId = 0);

@@ -16,6 +16,9 @@ struct Clause {
 
 struct Clauses : public Array<Clause> {
     bool isAssert = false; // From additions.md: ASSERT <clauses>
+    bool isFollow = false;
+    bool isRepeatFollow = false;
+    bool isOrConnection = false;
 };
 
 // ─── Column Type System ──────────────────────────────────────────────────────
@@ -33,6 +36,7 @@ struct BlobRange {
     u64 end;       // 0 = until value/data ends
     bool isInsert; // true for [30+] (shift data right, insert)
     bool isAppend; // true for [+] (append to end)
+    bool isSingleIndex; // true for [x]
     bool valid;    // whether a range was specified at all
 };
 
@@ -77,7 +81,7 @@ inline ParsedCol parseCol(const String& raw) {
 }
 
 inline BlobRange parseBlobRange(const String& spec) {
-    BlobRange r = {0, 0, false, false, false};
+    BlobRange r = {0, 0, false, false, false, false};
     if (spec.isEmpty() || spec.size() < 3) return r; // Minimum: "[+]"
     if (spec[0] != '[' || spec[spec.size() - 1] != ']') return r;
 
@@ -117,8 +121,13 @@ inline BlobRange parseBlobRange(const String& spec) {
         if (!startStr.isEmpty()) r.start = parseU64(startStr);
         if (!endStr.isEmpty()) r.end = parseU64(endStr);
     } else {
-        // No colon, just a number (for insert mode: [30+])
-        r.start = parseU64(inner);
+        // No colon, check if it's insert mode or single index lookup
+        if (r.isInsert) {
+            r.start = parseU64(inner);
+        } else {
+            r.start = parseU64(inner);
+            r.isSingleIndex = true;
+        }
     }
 
     return r;
@@ -146,6 +155,7 @@ inline Clauses operator&&(const Clauses& a, const Clauses& b) {
         result.push(clause);
     }
     result.isAssert = a.isAssert || b.isAssert;
+    result.isOrConnection = a.isOrConnection || b.isOrConnection;
     return result;
 }
 

@@ -52,6 +52,7 @@ struct PendingFreeze {
 
 class BlobStore {
 public:
+    friend class TableStore;
     BlockDevice* device;
     Allocator*   allocator;
 
@@ -141,7 +142,7 @@ public:
     // ─── Internal hash-based API (used by engine internals) ──────────────────
 
     // Reads content; respects [minOffset, maxOffset) range (0,0 = all)
-    String readHash(const String& hash, u64 minOffset = 0, u64 maxOffset = 0);
+    String readHash(const String& hash, u64 minOffset = 0, u64 maxOffset = 0, Map<String, String>* cache = nullptr);
 
     // Stores content keyed by hash; no-op if hash already present (content dedup)
     bool writeHash(const String& hash, u64 minOffset, const String& data,

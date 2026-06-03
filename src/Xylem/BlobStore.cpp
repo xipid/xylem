@@ -32,13 +32,29 @@ static u32 contBlockCap(u32 blockSize) {
 
 
 
-String BlobStore::readHash(const String& hash, u64 minOffset, u64 maxOffset) {
+String BlobStore::readHash(const String& hash, u64 minOffset, u64 maxOffset, Map<String, String>* cache) {
+    Map<String, String> localCache;
+    Map<String, String>* actualCache = cache ? cache : &localCache;
+
+    if (actualCache->has(hash)) {
+        String data = *actualCache->get(hash);
+        if (maxOffset > 0 && maxOffset > minOffset) {
+            u64 endIdx = maxOffset;
+            if (endIdx > (u64)data.size()) endIdx = (u64)data.size();
+            return data.slice((usz)minOffset, (usz)endIdx);
+        }
+        if (minOffset > 0) {
+            return data.slice((usz)minOffset);
+        }
+        return data;
+    }
+
     if (!bloomMayExist(hash)) return String();
     auto* m = index.get(hash);
     if (!m) return String();
 
     if (m->isDiff) {
-        String baseData = readHash(m->baseHash, 0, 0xFFFFFFFF);
+        String baseData = readHash(m->baseHash, 0, 0, actualCache);
         String diffBin;
         if (device && device->config.onDeviceRead && m->blockIdx != 0) {
             diffBin = readChain(m->blockIdx);
@@ -67,10 +83,12 @@ String BlobStore::readHash(const String& hash, u64 minOffset, u64 maxOffset) {
         diff.blobStore = this;
         String data = diff.toBinaryContent(this);
 
+        actualCache->set(hash, data);
+
         if (maxOffset > 0 && maxOffset > minOffset) {
-            u64 len = maxOffset - minOffset;
-            if (len > (u64)data.size() - minOffset) len = (u64)data.size() - minOffset;
-            return data.slice((usz)minOffset, (usz)len);
+            u64 endIdx = maxOffset;
+            if (endIdx > (u64)data.size()) endIdx = (u64)data.size();
+            return data.slice((usz)minOffset, (usz)endIdx);
         }
         if (minOffset > 0) {
             return data.slice((usz)minOffset);
@@ -106,7 +124,7 @@ String BlobStore::readHash(const String& hash, u64 minOffset, u64 maxOffset) {
             return String();
         }
     } else {
-        return String(); // No device or invalid block
+        return String();
     }
 
     String savedDict;
@@ -116,28 +134,23 @@ String BlobStore::readHash(const String& hash, u64 minOffset, u64 maxOffset) {
         savedDict = zstd.dictionary[0];
         zstd.setDictionary(String());
     }
-#endif
-
-#ifdef XI_ZSTD_ENABLED
     data = zstd.decompress(data);
-#endif
-
-#ifdef XI_ZSTD_ENABLED
     if (isTableRoot && !savedDict.isEmpty()) {
         zstd.setDictionary(savedDict);
     }
 #endif
 
-    // Attempt decryption using global keys
     if (globalKeys && globalKeys->size() > 0) {
         String decrypted = CryptItem::decrypt(data, *globalKeys);
         if (!decrypted.isEmpty()) data = decrypted;
     }
 
+    actualCache->set(hash, data);
+
     if (maxOffset > 0 && maxOffset > minOffset) {
-        u64 len = maxOffset - minOffset;
-        if (len > (u64)data.size() - minOffset) len = (u64)data.size() - minOffset;
-        return data.slice((usz)minOffset, (usz)len);
+        u64 endIdx = maxOffset;
+        if (endIdx > (u64)data.size()) endIdx = (u64)data.size();
+        return data.slice((usz)minOffset, (usz)endIdx);
     }
     if (minOffset > 0) {
         return data.slice((usz)minOffset);

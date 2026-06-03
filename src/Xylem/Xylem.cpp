@@ -1,4 +1,5 @@
 #include <Xylem/Xylem.hpp>
+#include <Xylem/XBDiff.hpp>
 #include <Xi/Random.hpp>
 #include <Sec/Crypto.hpp>
 #include <stdint.h>
@@ -755,7 +756,7 @@ QueryResult XylemEngine::query(const String& queryString, const Array<String>& s
 // ─── CRUD operations ─────────────────────────────────────────────────────────
 
 Array<Map<String,String>> XylemEngine::read(const Array<String>& columns, const Array<Clauses>& clauses,
-                                             u64 length, bool tombstones, u64 txId) {
+                                             u64 length, bool tombstones, u64 txId, bool readAllColumns) {
     ensureMounted();
     if (!tableStore) return {};
     u64 snapshotSeq = 0;
@@ -763,7 +764,7 @@ Array<Map<String,String>> XylemEngine::read(const Array<String>& columns, const 
         auto* ls = journal->activeLocks.get(txId);
         if (ls) snapshotSeq = ls->snapshotSeq;
     }
-    return tableStore->read(columns, clauses, length, tombstones, snapshotSeq, txId);
+    return tableStore->read(columns, clauses, length, tombstones, snapshotSeq, txId, readAllColumns);
 }
 
 bool XylemEngine::isWriteBlocked(u64 txId) {
@@ -785,11 +786,9 @@ int XylemEngine::write(const Array<Clause>& columns, const Array<Clauses>& claus
         if (!ls) return -1;
         
         if (tableStore && clauses.size() > 0) {
-            for (u64 rId : tableStore->allRowIds) {
-                Map<String, String>* row = tableStore->fetchRow(rId);
-                if (row && tableStore->evaluateClauses(*row, clauses) >= 0.0f) {
-                    journal->trackRow(txId, rId);
-                }
+            Array<u64> matchedIds = tableStore->getMatchingRowIds(clauses, ls->snapshotSeq, txId);
+            for (usz i = 0; i < matchedIds.size(); ++i) {
+                journal->trackRow(txId, matchedIds[i]);
             }
         }
         
@@ -930,16 +929,112 @@ int XylemEngine::unlock(u64 id) {
 void XylemEngine::mergeUnusedDiffs() {
     if (!blobStore || !tableStore || !journal) return;
     u64 oldest = journal->oldestActiveSnapshot();
+
+    auto isDirectlyNeeded = [&](const String& hash) -> bool {
+        if (hash == "XYLM_TABLE_ROOT" || hash == "XYLM_PENDING_FREEZES" || hash == "XYLM_REFS_USAGE") {
+            return true;
+        }
+        auto* m = blobStore->index.get(hash);
+        if (!m) return false;
+        if (m->frozen) return true;
+        bool isReferenced = tableStore->blobRefCounts.has(hash) && (*tableStore->blobRefCounts.get(hash) > 0);
+        if (isReferenced) return true;
+        if (m->isDiff && m->seq >= oldest) return true;
+        return false;
+    };
+
+    bool progress = true;
+    while (progress) {
+        progress = false;
+        
+        for (auto it = blobStore->index.begin(); it != blobStore->index.end(); ++it) {
+            String P = it->key;
+            if (isDirectlyNeeded(P)) {
+                continue;
+            }
+            
+            // Find all children of P
+            Array<String> children;
+            for (auto it2 = blobStore->index.begin(); it2 != blobStore->index.end(); ++it2) {
+                if (it2->value.isDiff && it2->value.baseHash == P) {
+                    children.push(it2->key);
+                }
+            }
+            
+            if (children.size() == 0) {
+                continue;
+            }
+            
+            if (it->value.isDiff) {
+                String GP = it->value.baseHash;
+                String GP_data = blobStore->readHash(GP, 0, 0xFFFFFFFF);
+                
+                for (usz i = 0; i < children.size(); ++i) {
+                    String C = children[i];
+                    String C_data = blobStore->readHash(C, 0, 0xFFFFFFFF);
+                    
+                    XBDiff diff = XBDiff::create(GP_data, C_data);
+                    String diffBin = diff.toBinary();
+                    
+                    auto* cMeta = blobStore->index.get(C);
+                    u32 cRef = cMeta ? cMeta->ref : 0;
+                    bool cUsed = cMeta ? cMeta->used : false;
+                    u64 cSeq = cMeta ? cMeta->seq : 0;
+                    
+                    blobStore->removeHash(C);
+                    blobStore->writeDiffHash(C, GP, diffBin, "");
+                    
+                    auto* newCMeta = blobStore->index.get(C);
+                    if (newCMeta) {
+                        newCMeta->ref = cRef;
+                        newCMeta->used = cUsed;
+                        newCMeta->seq = cSeq;
+                    }
+                }
+            } else {
+                for (usz i = 0; i < children.size(); ++i) {
+                    String C = children[i];
+                    String C_data = blobStore->readHash(C, 0, 0xFFFFFFFF);
+                    
+                    auto* cMeta = blobStore->index.get(C);
+                    u32 cRef = cMeta ? cMeta->ref : 0;
+                    bool cUsed = cMeta ? cMeta->used : false;
+                    u64 cSeq = cMeta ? cMeta->seq : 0;
+                    
+                    blobStore->removeHash(C);
+                    blobStore->writeHash(C, 0, C_data, "");
+                    
+                    auto* newCMeta = blobStore->index.get(C);
+                    if (newCMeta) {
+                        newCMeta->ref = cRef;
+                        newCMeta->used = cUsed;
+                        newCMeta->seq = cSeq;
+                    }
+                }
+            }
+            
+            progress = true;
+            break; // Iterator invalidated, restart
+        }
+    }
+    
     Array<String> toRemove;
     for (auto it = blobStore->index.begin(); it != blobStore->index.end(); ++it) {
-        if (it->value.isDiff) {
-            bool isReferenced = tableStore->blobRefCounts.has(it->key) && (*tableStore->blobRefCounts.get(it->key) > 0);
-            bool neededByActiveTx = (it->value.seq >= oldest);
-            if (!isReferenced && !neededByActiveTx) {
-                toRemove.push(it->key);
+        String H = it->key;
+        if (!isDirectlyNeeded(H)) {
+            bool hasChildren = false;
+            for (auto it2 = blobStore->index.begin(); it2 != blobStore->index.end(); ++it2) {
+                if (it2->value.isDiff && it2->value.baseHash == H) {
+                    hasChildren = true;
+                    break;
+                }
+            }
+            if (!hasChildren) {
+                toRemove.push(H);
             }
         }
     }
+    
     for (usz i = 0; i < toRemove.size(); ++i) {
         blobStore->removeHash(toRemove[i]);
     }

@@ -47,7 +47,8 @@ public:
     // Returns: 0 = success, >0 = ASSERT clause index, -1 = locked/error, -2 = MVCC conflict
 
     Array<Map<String,String>> read(const Array<String>& columns, const Array<Clauses>& clauses,
-                                    u64 length = 0, bool tombstones = false, u64 txId = 0);
+                                    u64 length = 0, bool tombstones = false, u64 txId = 0,
+                                    bool readAllColumns = false);
     int write(const Array<Clause>& columns, const Array<Clauses>& clauses = Array<Clauses>(),
               u64 txId = 0, const String& encryptionKey = "");
     int writeVolatile(const Array<Clause>& columns, const Array<Clauses>& clauses = Array<Clauses>(),
