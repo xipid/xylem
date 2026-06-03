@@ -3,7 +3,7 @@
 
 #include <Collection/String.hpp>
 #include <Collection/Array.hpp>
-#include <Sec/Crypto.hpp>
+#include <Security/Crypto.hpp>
 #include <Xi/Random.hpp>
 #include <Xylem/Format.hpp>
 #include <stdio.h>
@@ -21,7 +21,7 @@ struct CryptItem {
         if (key.isEmpty()) return plaintext;
         u64 nonce = ((u64)Xi::randomNext() << 32) | Xi::randomNext();
         u32 crc = crc32(plaintext);
-        String cipher = Sec::streamXor(key, nonce, plaintext);
+        String cipher = Security::streamXor(key, nonce, plaintext);
         
         String res;
         res.allocate(6 + 8 + 4 + cipher.size());
@@ -45,7 +45,7 @@ struct CryptItem {
         String cipher = data.slice(18);
         
         for(const auto& key : keys) {
-            String plain = Sec::streamXor(key, nonce, cipher);
+            String plain = Security::streamXor(key, nonce, cipher);
             if (crc32(plain) == crc) {
                 if (successfulKey) *successfulKey = key;
                 return plain;

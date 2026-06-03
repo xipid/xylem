@@ -148,7 +148,7 @@ int main() {
   String largePayload;
   largePayload.allocate(50 * 1024); // 50KB
   largePayload.fill('X');
-  String h1 = Sec::hash(largePayload, 16);
+  String h1 = Security::hash(largePayload, 16);
 
   for (int i = 0; i < 100; ++i) {
     xm.writeHash(largePayload); // Write it 100 times (CAS dedup)

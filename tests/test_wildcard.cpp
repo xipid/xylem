@@ -40,7 +40,8 @@ int main() {
     xm.mount();
     
     // Create folders/files for wildcard matching tests
-    // root -> src -> Sec -> Crypto.cpp, Writ.cpp, * (literal asterisk)
+    // Create folders/files for wildcard matching tests
+    // root -> src -> Security -> Crypto.cpp, Writ.cpp, * (literal asterisk)
     // root -> src -> main.cpp
     
     auto makeDir = [&](const String& id, const String& pId, const String& name) {
@@ -64,7 +65,7 @@ int main() {
 
     makeDir("root_id", "0", "root");
     makeDir("src_id", "root_id", "src");
-    makeDir("sec_id", "src_id", "Sec");
+    makeDir("sec_id", "src_id", "Security");
     
     makeFile("crypto_id", "sec_id", "Crypto.cpp", "crypto content");
     makeFile("writ_id", "sec_id", "Writ.cpp", "writ content");
@@ -74,11 +75,11 @@ int main() {
     Array<String> cols;
     cols.push("name");
     
-    // Test 1: Wildcard matching: root/src/Sec/*.cpp
+    // Test 1: Wildcard matching: root/src/Security/*.cpp
     {
-        Info("Test 1: Match root/src/Sec/*.cpp");
+        Info("Test 1: Match root/src/Security/*.cpp");
         Array<Clauses> q;
-        q.push(WHERE("name", "path", "root/src/Sec/*.cpp"));
+        q.push(WHERE("name", "path", "root/src/Security/*.cpp"));
         auto res = xm.read(cols, q);
         if (res.size() != 2) {
             Error("Test 1 failed: Expected 2 matching files, got " + String::from((u64)res.size()));
@@ -87,11 +88,11 @@ int main() {
         Success("Test 1 passed!");
     }
 
-    // Test 2: Wildcard matching with escaped wildcard: root/src/Sec/\*
+    // Test 2: Wildcard matching with escaped wildcard: root/src/Security/\*
     {
-        Info("Test 2: Match root/src/Sec/\\* (literal)");
+        Info("Test 2: Match root/src/Security/\\* (literal)");
         Array<Clauses> q;
-        q.push(WHERE("name", "path", "root/src/Sec/\\*"));
+        q.push(WHERE("name", "path", "root/src/Security/\\*"));
         auto res = xm.read(cols, q);
         if (res.size() != 1 || *res[0].get("name") != "*") {
             Error("Test 2 failed: Expected 1 file named '*', got " + String::from((u64)res.size()));
@@ -100,11 +101,11 @@ int main() {
         Success("Test 2 passed!");
     }
 
-    // Test 3: Path query regex syntax: root/src/Sec/.*\.cpp
+    // Test 3: Path query regex syntax: root/src/Security/.*\.cpp
     {
-        Info("Test 3: Match root/src/Sec/.*\\.cpp (regex)");
+        Info("Test 3: Match root/src/Security/.*\\.cpp (regex)");
         Array<Clauses> q;
-        q.push(WHERE("name", "path", "root/src/Sec/.*\\.cpp"));
+        q.push(WHERE("name", "path", "root/src/Security/.*\\.cpp"));
         auto res = xm.read(cols, q);
         if (res.size() != 2) {
             Error("Test 3 failed: Expected 2 matching files via regex, got " + String::from((u64)res.size()));

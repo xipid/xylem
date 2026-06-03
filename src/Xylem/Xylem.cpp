@@ -1,7 +1,7 @@
 #include <Xylem/Xylem.hpp>
 #include <Xylem/XBDiff.hpp>
 #include <Xi/Random.hpp>
-#include <Sec/Crypto.hpp>
+#include <Security/Crypto.hpp>
 #include <stdint.h>
 #include <stdio.h>
 
@@ -1043,7 +1043,7 @@ void XylemEngine::mergeUnusedDiffs() {
 // ─── Blob API ─────────────────────────────────────────────────────────────────
 
 String XylemEngine::writeHash(const String& content) {
-    String hash = Sec::hash(content, 16);
+    String hash = Security::hash(content, 16);
     if (blobStore) blobStore->writeHash(hash, 0, content, "");
     return hash;
 }
@@ -1054,7 +1054,7 @@ String XylemEngine::writeHash(const String& content, const String& hash) {
 }
 
 String XylemEngine::writeHash(const String& content, u64 position) {
-    String hash = Sec::hash(content, 16);
+    String hash = Security::hash(content, 16);
     if (blobStore) {
         if (blobStore->wouldOverlap(position, (u32)content.size())) return hash;
         blobStore->writeHash(hash, 0, content, "");

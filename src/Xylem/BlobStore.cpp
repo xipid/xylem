@@ -806,7 +806,7 @@ String BlobStore::setBlob(u32 ref) {
     auto* oldHash = refToHash.get(ref);
     if (!oldHash) return String();
     String data = readHash(*oldHash, 0, 0xFFFFFFFF);
-    String newHash = Sec::hash(data, 16);
+    String newHash = Security::hash(data, 16);
     if (newHash != *oldHash) {
         removeHash(*oldHash);
         writeHash(newHash, 0, data, "");

@@ -482,7 +482,7 @@ int main() {
   blobRow2.push({"data:blob", "=", sharedBlob});
   xm.write(blobRow2);
 
-  String refHash = Sec::hash(sharedBlob, 16);
+  String refHash = Security::hash(sharedBlob, 16);
 
   // Delete one — blob should survive (still referenced by ref2)
   xm.remove(OR(WHERE("ref_id", "=", "ref1")));

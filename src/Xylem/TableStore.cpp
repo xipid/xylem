@@ -1,7 +1,7 @@
 #include <Xylem/TableStore.hpp>
 #include <Xylem/BlobStore.hpp>
 #include <Xylem/CryptItem.hpp>
-#include <Sec/Crypto.hpp>
+#include <Security/Crypto.hpp>
 #include <algorithm>
 #include <cmath>
 #include <regex>
@@ -871,7 +871,7 @@ f32 TableStore::evaluateClause(const Map<String, String>& row, const Clause& cla
     if (clause.op == "=") return (val == targetVal) ? 1.0f : -1.0f;
 
     if (clause.op == "hash") {
-        return (Sec::hash(val, 16) == targetVal) ? 1.0f : -1.0f;
+        return (Security::hash(val, 16) == targetVal) ? 1.0f : -1.0f;
     }
 
     // Numeric comparison operators
@@ -1379,7 +1379,7 @@ Array<Map<String, String>> TableStore::read(const Array<String>& columns, const 
                 if (isBlobRef(decryptedVal)) {
                     outRow.set(key, extractBlobHash(decryptedVal));
                 } else {
-                    outRow.set(key, Sec::hash(decryptedVal, 16));
+                    outRow.set(key, Security::hash(decryptedVal, 16));
                 }
             } else if (sel.hasDiff) {
                 if (isBlobRef(decryptedVal) && blobStore) {
@@ -1543,7 +1543,7 @@ int TableStore::write(const Array<Clause>& columns, const Array<Clauses>& clause
             
             if (pc.type == ColType::BLOB && blobStore) {
                 // Hash the content, store blob, save reference
-                String hash = Sec::hash(c.val, 16);
+                String hash = Security::hash(c.val, 16);
                 blobStore->writeHash(hash, 0, c.val, encryptionKey);
                 incrementBlobRef(hash);
                 String ref = makeBlobRef(hash);
@@ -1719,7 +1719,7 @@ int TableStore::write(const Array<Clause>& columns, const Array<Clauses>& clause
                             content = applyBlobRange(existing, col.val, br);
                         }
                     }
-                    String hash = Sec::hash(content, 16);
+                    String hash = Security::hash(content, 16);
                     blobStore->writeHash(hash, 0, content, keyToUse, oldBlobHashToDecrement, currentSeq);
                     incrementBlobRef(hash);
                     String ref = makeBlobRef(hash);
