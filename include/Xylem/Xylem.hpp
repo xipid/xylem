@@ -17,19 +17,9 @@ class XylemEngine {
 public:
     DeviceConfig config;
     usz maxCache = 1024 * 1024;
-    Array<String> globalKeys;
     void addKey(const String& key) { globalKeys.push(key); }
 
-    u8 pinnedRawBits[1024];
-    u32 currentSuperblockIdx = 0xFFFFFFFFu;
-
     BlockDevice* device = nullptr;
-    Allocator* allocator = nullptr;
-    Journal* journal = nullptr;
-    TableStore* tableStore = nullptr;
-    BlobStore* blobStore = nullptr;
-    Cache* cache = nullptr;
-    Watcher* watcher = nullptr;
 
     XylemEngine();
     ~XylemEngine();
@@ -47,13 +37,13 @@ public:
     // Returns: 0 = success, >0 = ASSERT clause index, -1 = locked/error, -2 = MVCC conflict
 
     Array<Map<String,String>> read(const Array<String>& columns, const Array<Clauses>& clauses,
-                                    u64 length = 0, bool tombstones = false, u64 txId = 0,
+                                    u64 length = 0, u64 page = 0, bool tombstones = false, u64 txId = 0,
                                     bool readAllColumns = false);
     int write(const Array<Clause>& columns, const Array<Clauses>& clauses = Array<Clauses>(),
               u64 txId = 0, const String& encryptionKey = "");
     int writeVolatile(const Array<Clause>& columns, const Array<Clauses>& clauses = Array<Clauses>(),
                       u64 txId = 0, const String& encryptionKey = "");
-    bool remove(const Array<Clauses>& clauses, u64 length = 0, u64 as = 0);
+    bool rm(const Array<Clauses>& clauses, u64 length = 0, u64 as = 0);
 
 
     // Transactions (MVCC)
@@ -62,7 +52,6 @@ public:
     u64 commit(const Array<Clauses>& clauses = Array<Clauses>(), u64 id = 0);
     bool rollback(u64 id);
     int  unlock(u64 id);
-    void mergeUnusedDiffs();
 
     String generateId(const String& column);
 
@@ -106,7 +95,9 @@ public:
     QueryResult cat(const String& path, u64 start = 0, u64 end = 0);
     QueryResult tee(const String& path, const String& content, u64 start = 0, u64 end = 0);
     QueryResult ls(const String& path = "");
-    bool unlink(const String& path);
+    bool rm(const String& path);
+    QueryResult cp(const String& src, const String& dst);
+    QueryResult mv(const String& src, const String& dst);
 
     // ─── Reactivity ─────────────────────────────────────────────────────────
 
@@ -116,8 +107,23 @@ public:
     Array<Map<String,String>> pull(u64 id);
 
 private:
+    friend class QueryParser;
+
+    u8 pinnedRawBits[1024];
+    u32 currentSuperblockIdx = 0xFFFFFFFFu;
+
+    Allocator* allocator = nullptr;
+    Journal* journal = nullptr;
+    TableStore* tableStore = nullptr;
+    BlobStore* blobStore = nullptr;
+    Cache* cache = nullptr;
+    Watcher* watcher = nullptr;
+
+    Array<String> globalKeys;
+
     void ensureMounted();
     bool isWriteBlocked(u64 txId);
+    void mergeUnusedDiffs();
 };
 
 } // namespace Xylem

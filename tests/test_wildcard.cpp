@@ -13,8 +13,8 @@ int main() {
     xm.config.deviceSize = 1024 * 1024 * 10; // 10MB
     xm.config.blockSize = 4096;
     
-    unlink("test_wildcard.xy");
-    int fd = open("test_wildcard.xy", O_RDWR | O_CREAT, 0644);
+    unlink("/tmp/test_wildcard.xy");
+    int fd = open("/tmp/test_wildcard.xy", O_RDWR | O_CREAT, 0644);
     
     xm.config.onDeviceRead = [fd](u64 offset, u64 maxOffset) -> String {
         String buf;
@@ -63,7 +63,7 @@ int main() {
         xm.write(r);
     };
 
-    makeDir("root_id", "0", "root");
+    makeDir("root_id", "", "root");
     makeDir("src_id", "root_id", "src");
     makeDir("sec_id", "src_id", "Security");
     
@@ -137,7 +137,7 @@ int main() {
 
     xm.destroy();
     close(fd);
-    unlink("test_wildcard.xy");
+    unlink("/tmp/test_wildcard.xy");
     
     Success("All path wildcard and transaction commit tests passed!");
     return 0;

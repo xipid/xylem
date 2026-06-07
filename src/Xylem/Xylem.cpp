@@ -756,7 +756,7 @@ QueryResult XylemEngine::query(const String& queryString, const Array<String>& s
 // ─── CRUD operations ─────────────────────────────────────────────────────────
 
 Array<Map<String,String>> XylemEngine::read(const Array<String>& columns, const Array<Clauses>& clauses,
-                                             u64 length, bool tombstones, u64 txId, bool readAllColumns) {
+                                             u64 length, u64 page, bool tombstones, u64 txId, bool readAllColumns) {
     ensureMounted();
     if (!tableStore) return {};
     u64 snapshotSeq = 0;
@@ -764,7 +764,7 @@ Array<Map<String,String>> XylemEngine::read(const Array<String>& columns, const 
         auto* ls = journal->activeLocks.get(txId);
         if (ls) snapshotSeq = ls->snapshotSeq;
     }
-    return tableStore->read(columns, clauses, length, tombstones, snapshotSeq, txId, readAllColumns);
+    return tableStore->read(columns, clauses, length, page, tombstones, snapshotSeq, txId, readAllColumns);
 }
 
 bool XylemEngine::isWriteBlocked(u64 txId) {
@@ -842,10 +842,10 @@ int XylemEngine::writeVolatile(const Array<Clause>& columns, const Array<Clauses
 }
 
 
-bool XylemEngine::remove(const Array<Clauses>& clauses, u64 length, u64 as) {
+bool XylemEngine::rm(const Array<Clauses>& clauses, u64 length, u64 as) {
     ensureMounted();
     if (isWriteBlocked(as)) return false;
-    bool ok = tableStore->remove(clauses, length);
+    bool ok = tableStore->rm(clauses, length);
     if (ok) {
         String payload = Journal::serializeTableRemove(clauses, length);
         if (as != 0) {
@@ -931,7 +931,11 @@ void XylemEngine::mergeUnusedDiffs() {
     u64 oldest = journal->oldestActiveSnapshot();
 
     auto isDirectlyNeeded = [&](const String& hash) -> bool {
-        if (hash == "XYLM_TABLE_ROOT" || hash == "XYLM_PENDING_FREEZES" || hash == "XYLM_REFS_USAGE") {
+        if (hash.startsWith("XYLM_") ||
+            hash.startsWith("ROW_BLOCK_") ||
+            hash.startsWith("VOLATILE_BLOCK_") ||
+            hash.startsWith("ROW_") ||
+            hash.startsWith("HNSW_")) {
             return true;
         }
         auto* m = blobStore->index.get(hash);
@@ -1382,7 +1386,23 @@ QueryResult XylemEngine::cat(const String& path, u64 start, u64 end) {
     ensureMounted();
     QueryResult res;
     
-    String normPath = path;
+    u64 s = start;
+    u64 e = end;
+    String cleanPath = path;
+    long long bracketPos = -1;
+    for (usz i = 0; i < path.size(); ++i) {
+        if (path[i] == '[') { bracketPos = (long long)i; break; }
+    }
+    if (bracketPos >= 0) {
+        cleanPath = path.slice(0, bracketPos);
+        BlobRange br = parseBlobRange(path.slice(bracketPos));
+        if (br.valid) {
+            s = br.start;
+            e = br.isSingleIndex ? (br.start + 1) : br.end;
+        }
+    }
+    
+    String normPath = cleanPath;
     if (normPath.endsWith("/") && normPath.size() > 1) {
         normPath = normPath.slice(0, normPath.size() - 1);
     }
@@ -1396,11 +1416,11 @@ QueryResult XylemEngine::cat(const String& path, u64 start, u64 end) {
     auto rows = read(cols, queryClauses);
     if (rows.size() > 0 && rows[0].has("content")) {
         String content = *rows[0].get("content");
-        if (start > 0 || end > 0) {
-            u64 s = start;
-            u64 e = (end > 0) ? end : (u64)content.size();
-            if (e > (u64)content.size()) e = (u64)content.size();
-            if (s < e) content = content.slice((usz)s, (usz)e);
+        if (s > 0 || e > 0 || bracketPos >= 0) {
+            u64 s_idx = s;
+            u64 e_idx = (e > 0) ? e : (u64)content.size();
+            if (e_idx > (u64)content.size()) e_idx = (u64)content.size();
+            if (s_idx < e_idx) content = content.slice((usz)s_idx, (usz)e_idx);
             else content = "";
         }
         Map<String, String> row;
@@ -1417,7 +1437,23 @@ QueryResult XylemEngine::tee(const String& path, const String& content, u64 star
     ensureMounted();
     QueryResult res;
     
-    String normPath = path;
+    u64 s = start;
+    u64 e = end;
+    String cleanPath = path;
+    long long bracketPos = -1;
+    for (usz i = 0; i < path.size(); ++i) {
+        if (path[i] == '[') { bracketPos = (long long)i; break; }
+    }
+    if (bracketPos >= 0) {
+        cleanPath = path.slice(0, bracketPos);
+        BlobRange br = parseBlobRange(path.slice(bracketPos));
+        if (br.valid) {
+            s = br.start;
+            e = br.isSingleIndex ? (br.start + 1) : br.end;
+        }
+    }
+    
+    String normPath = cleanPath;
     if (normPath.endsWith("/") && normPath.size() > 1) {
         normPath = normPath.slice(0, normPath.size() - 1);
     }
@@ -1436,8 +1472,8 @@ QueryResult XylemEngine::tee(const String& path, const String& content, u64 star
         
         Array<Clause> writeCols;
         String colName = (content.size() > 512) ? "content:blob" : "content";
-        if (start > 0 || end > 0) {
-            colName += "[" + String::from((long long)start) + ":" + String::from((long long)end) + "]";
+        if (s > 0 || e > 0 || bracketPos >= 0) {
+            colName += "[" + String::from((long long)s) + ":" + String::from((long long)e) + "]";
         }
         writeCols.push({colName, "=", content});
         
@@ -1454,7 +1490,7 @@ QueryResult XylemEngine::tee(const String& path, const String& content, u64 star
         }
         if (cleanParts.size() == 0) return QueryResult();
         
-        String currentParentId = "0";
+        String currentParentId = "";
         String currentPathStr = "";
         
         // Traverse down the directories and create them if missing
@@ -1514,16 +1550,6 @@ QueryResult XylemEngine::ls(const String& path) {
         normPath = normPath.slice(0, normPath.size() - 1);
     }
     
-    String queryPath = normPath;
-    if (queryPath.isEmpty() || queryPath == "/") {
-        queryPath = "/*";
-    } else {
-        if (!queryPath.startsWith("/")) {
-            queryPath = "/" + queryPath;
-        }
-        queryPath = queryPath + "/*";
-    }
-    
     Array<String> cols;
     cols.push("id");
     cols.push("name");
@@ -1532,14 +1558,23 @@ QueryResult XylemEngine::ls(const String& path) {
     cols.push("perms");
     
     Array<Clauses> queryClauses;
-    queryClauses.push(WHERE("name", "path", queryPath));
+    if (normPath.isEmpty() || normPath == "/") {
+        queryClauses.push(WHERE("parent_id", "empty", ""));
+    } else {
+        String queryPath = normPath;
+        if (!queryPath.startsWith("/")) {
+            queryPath = "/" + queryPath;
+        }
+        queryPath = queryPath + "/*";
+        queryClauses.push(WHERE("name", "path", queryPath));
+    }
     
     res.readRows = read(cols, queryClauses);
     res.code = (int)res.readRows.size();
     return res;
 }
 
-bool XylemEngine::unlink(const String& path) {
+bool XylemEngine::rm(const String& path) {
     ensureMounted();
     if (!tableStore) return false;
     
@@ -1551,9 +1586,206 @@ bool XylemEngine::unlink(const String& path) {
     Array<Clauses> queryClauses;
     queryClauses.push(WHERE("name", "path", normPath + "/**"));
     
-    bool r = remove(queryClauses);
+    bool r = rm(queryClauses);
     flush();
     return r;
+}
+
+QueryResult XylemEngine::cp(const String& src, const String& dst) {
+    ensureMounted();
+    QueryResult res;
+    res.code = -1;
+
+    String cleanSrc = src;
+    String cleanDst = dst;
+    if (cleanSrc.endsWith("/") && cleanSrc.size() > 1) cleanSrc = cleanSrc.slice(0, cleanSrc.size() - 1);
+    if (cleanDst.endsWith("/") && cleanDst.size() > 1) cleanDst = cleanDst.slice(0, cleanDst.size() - 1);
+
+    Array<String> cols;
+    cols.push("id");
+    cols.push("name");
+    cols.push("parent_id");
+    cols.push("type");
+    cols.push("perms");
+    cols.push("content");
+
+    Array<Clauses> srcClauses;
+    srcClauses.push(WHERE("name", "path", cleanSrc));
+    auto srcRows = read(cols, srcClauses);
+
+    if (srcRows.size() == 0) return res;
+
+    const auto& srcRow = srcRows[0];
+    String type = srcRow.has("type") ? *srcRow.get("type") : "file";
+    String perms = srcRow.has("perms") ? *srcRow.get("perms") : "644";
+    String content = srcRow.has("content") ? *srcRow.get("content") : "";
+
+    if (type == "file") {
+        res = tee(cleanDst, content);
+        if (res.code == 0) {
+            Array<String> dstCols; dstCols.push("id");
+            Array<Clauses> dstClauses; dstClauses.push(WHERE("name", "path", cleanDst));
+            auto dstRows = read(dstCols, dstClauses);
+            if (dstRows.size() > 0 && dstRows[0].has("id")) {
+                Array<Clause> updateCols;
+                updateCols.push({"perms", "=", perms});
+                Array<Clauses> updateClauses;
+                updateClauses.push(WHERE("id", "=", *dstRows[0].get("id")));
+                write(updateCols, updateClauses);
+            }
+        }
+    } else {
+        Array<Clauses> descClauses;
+        descClauses.push(WHERE("name", "path", cleanSrc + "/**"));
+        auto descRows = read(cols, descClauses);
+
+        Array<String> dstParts = cleanDst.split("/");
+        Array<String> cleanDstParts;
+        for (usz i = 0; i < dstParts.size(); ++i) {
+            if (!dstParts[i].isEmpty()) cleanDstParts.push(dstParts[i]);
+        }
+
+        String currentParentId = "";
+        for (usz i = 0; i < cleanDstParts.size(); ++i) {
+            String currentPathStr = "";
+            for (usz j = 0; j <= i; ++j) currentPathStr += "/" + cleanDstParts[j];
+
+            Array<Clauses> dirClauses;
+            dirClauses.push(WHERE("name", "path", currentPathStr));
+            Array<String> minCols; minCols.push("id");
+            auto dirRows = read(minCols, dirClauses);
+
+            if (dirRows.size() > 0 && dirRows[0].has("id")) {
+                currentParentId = *dirRows[0].get("id");
+            } else {
+                u64 rnd = ((u64)Xi::randomNext() << 32) | Xi::randomNext();
+                String newId(rnd);
+
+                Array<Clause> dirCols;
+                dirCols.push({"name", "=", cleanDstParts[i]});
+                dirCols.push({"parent_id", "=", currentParentId});
+                dirCols.push({"id", "=", newId});
+                dirCols.push({"type", "=", "dir"});
+                dirCols.push({"perms", "=", (i == cleanDstParts.size() - 1) ? perms : "755"});
+
+                write(dirCols);
+                currentParentId = newId;
+            }
+        }
+
+        String dstDirId = currentParentId;
+        String srcDirId = *srcRow.get("id");
+
+        Map<String, String> srcIdToDstId;
+        srcIdToDstId.set(srcDirId, dstDirId);
+
+        Array<Map<String, String>> pending = descRows;
+        bool progress = true;
+        while (progress && pending.size() > 0) {
+            progress = false;
+            Array<Map<String, String>> nextPending;
+            for (usz i = 0; i < pending.size(); ++i) {
+                const auto& row = pending[i];
+                String pId = row.has("parent_id") ? *row.get("parent_id") : "";
+                if (srcIdToDstId.has(pId)) {
+                    u64 rnd = ((u64)Xi::randomNext() << 32) | Xi::randomNext();
+                    String newId(rnd);
+
+                    Array<Clause> fileCols;
+                    fileCols.push({"name", "=", *row.get("name")});
+                    fileCols.push({"parent_id", "=", *srcIdToDstId.get(pId)});
+                    fileCols.push({"id", "=", newId});
+                    fileCols.push({"type", "=", row.has("type") ? *row.get("type") : "file"});
+                    fileCols.push({"perms", "=", row.has("perms") ? *row.get("perms") : "644"});
+                    if (row.has("content")) {
+                        fileCols.push({"content", "=", *row.get("content")});
+                    }
+
+                    write(fileCols);
+                    srcIdToDstId.set(*row.get("id"), newId);
+                    progress = true;
+                } else {
+                    nextPending.push(row);
+                }
+            }
+            pending = nextPending;
+        }
+        res.code = 0;
+    }
+    flush();
+    return res;
+}
+
+QueryResult XylemEngine::mv(const String& src, const String& dst) {
+    ensureMounted();
+    QueryResult res;
+    res.code = -1;
+
+    String cleanSrc = src;
+    String cleanDst = dst;
+    if (cleanSrc.endsWith("/") && cleanSrc.size() > 1) cleanSrc = cleanSrc.slice(0, cleanSrc.size() - 1);
+    if (cleanDst.endsWith("/") && cleanDst.size() > 1) cleanDst = cleanDst.slice(0, cleanDst.size() - 1);
+
+    Array<String> cols;
+    cols.push("id");
+    cols.push("name");
+    cols.push("parent_id");
+    
+    Array<Clauses> srcClauses;
+    srcClauses.push(WHERE("name", "path", cleanSrc));
+    auto srcRows = read(cols, srcClauses);
+
+    if (srcRows.size() == 0) return res;
+
+    String srcId = *srcRows[0].get("id");
+
+    Array<String> dstParts = cleanDst.split("/");
+    Array<String> cleanDstParts;
+    for (usz i = 0; i < dstParts.size(); ++i) {
+        if (!dstParts[i].isEmpty()) cleanDstParts.push(dstParts[i]);
+    }
+    if (cleanDstParts.size() == 0) return res;
+
+    String dstName = cleanDstParts[cleanDstParts.size() - 1];
+
+    String currentParentId = "";
+    for (usz i = 0; i < cleanDstParts.size() - 1; ++i) {
+        String currentPathStr = "";
+        for (usz j = 0; j <= i; ++j) currentPathStr += "/" + cleanDstParts[j];
+
+        Array<Clauses> dirClauses;
+        dirClauses.push(WHERE("name", "path", currentPathStr));
+        Array<String> minCols; minCols.push("id");
+        auto dirRows = read(minCols, dirClauses);
+
+        if (dirRows.size() > 0 && dirRows[0].has("id")) {
+            currentParentId = *dirRows[0].get("id");
+        } else {
+            u64 rnd = ((u64)Xi::randomNext() << 32) | Xi::randomNext();
+            String newId(rnd);
+
+            Array<Clause> dirCols;
+            dirCols.push({"name", "=", cleanDstParts[i]});
+            dirCols.push({"parent_id", "=", currentParentId});
+            dirCols.push({"id", "=", newId});
+            dirCols.push({"type", "=", "dir"});
+            dirCols.push({"perms", "=", "755"});
+
+            write(dirCols);
+            currentParentId = newId;
+        }
+    }
+
+    Array<Clause> updateCols;
+    updateCols.push({"name", "=", dstName});
+    updateCols.push({"parent_id", "=", currentParentId});
+
+    Array<Clauses> updateClauses;
+    updateClauses.push(WHERE("id", "=", srcId));
+
+    res.code = write(updateCols, updateClauses);
+    flush();
+    return res;
 }
 
 // ─── Watch / Pull ─────────────────────────────────────────────────────────────

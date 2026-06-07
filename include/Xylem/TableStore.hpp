@@ -126,13 +126,13 @@ public:
     // ─── CRUD (returns 0=ok, >0=ASSERT index, -1=error) ─────────────────────
 
     Array<Map<String, String>> read(const Array<String>& columns, const Array<Clauses>& clauses,
-                                     u64 length = 0, bool tombstones = false,
+                                     u64 length = 0, u64 page = 0, bool tombstones = false,
                                      u64 snapshotSeq = 0, u64 txId = 0,
                                      bool readAllColumns = false);
     
     int write(const Array<Clause>& columns, const Array<Clauses>& clauses = Array<Clauses>(),
               const String& encryptionKey = "", u64 txId = 0, bool isVolatile = false);
-    bool remove(const Array<Clauses>& clauses, u64 length = 0);
+    bool rm(const Array<Clauses>& clauses, u64 length = 0);
 
     Array<u64> getMatchingRowIds(const Array<Clauses>& clauses, u64 snapshotSeq, u64 txId);
     

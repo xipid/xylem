@@ -23,11 +23,11 @@ struct Clauses : public Array<Clause> {
 
 // ─── Column Type System ──────────────────────────────────────────────────────
 
-enum class ColType : u8 { STRING, BLOB, VIRTUAL };
+enum class ColType : u8 { STRING, BLOB, WATCH };
 
 struct ParsedCol {
     String name;       // "content" (suffix stripped)
-    ColType type;      // BLOB, VIRTUAL, or STRING
+    ColType type;      // BLOB, WATCH, or STRING
     String rangeSpec;  // "[0:20]", "[30:]", "[30+]", "[+]", or empty
 };
 
@@ -41,8 +41,8 @@ struct BlobRange {
 };
 
 // Parse "content:blob[0:20]" → {name="content", type=BLOB, range="[0:20]"}
-// Parse "_cmd:virtual"        → {name="_cmd",    type=VIRTUAL, range=""}
-// Parse "_cmd"                → {name="_cmd",    type=VIRTUAL, range=""} (auto)
+// Parse "_cmd:watch"          → {name="_cmd",    type=WATCH, range=""}
+// Parse "_cmd"                → {name="_cmd",    type=WATCH, range=""} (auto)
 // Parse "status"              → {name="status",  type=STRING,  range=""}
 inline ParsedCol parseCol(const String& raw) {
     ParsedCol result;
@@ -57,7 +57,7 @@ inline ParsedCol parseCol(const String& raw) {
     String nameAndType = (bracketPos >= 0) ? raw.slice(0, bracketPos) : raw;
     result.rangeSpec = (bracketPos >= 0) ? raw.slice(bracketPos) : String();
 
-    // Find type suffix :blob or :virtual
+    // Find type suffix :blob or :watch
     long long colonPos = -1;
     for (usz i = 0; i < nameAndType.size(); ++i) {
         if (nameAndType[i] == ':') { colonPos = (long long)i; break; }
@@ -67,14 +67,14 @@ inline ParsedCol parseCol(const String& raw) {
         result.name = nameAndType.slice(0, colonPos);
         String suffix = nameAndType.slice(colonPos + 1);
         if (suffix == "blob") result.type = ColType::BLOB;
-        else if (suffix == "virtual") result.type = ColType::VIRTUAL;
+        else if (suffix == "watch") result.type = ColType::WATCH;
     } else {
         result.name = nameAndType;
     }
 
-    // Auto-detect _ prefix as VIRTUAL
+    // Auto-detect _ prefix as WATCH
     if (result.type == ColType::STRING && result.name.size() > 0 && result.name[0] == '_') {
-        result.type = ColType::VIRTUAL;
+        result.type = ColType::WATCH;
     }
 
     return result;

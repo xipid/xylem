@@ -91,6 +91,7 @@ void Journal::recover(TableStore* ts) {
 
         u64 seq = *(u64*)ptr; ptr += 8;
         if (seq == 0 || seq == 0xFFFFFFFFFFFFFFFFULL) continue; // Uninitialized block
+        if (seq <= this->currentSequence) continue;
 
         u32 entryCount = *(u32*)ptr; ptr += 4;
         if (entryCount > 10000) continue; // Sanity check
@@ -367,7 +368,7 @@ void Journal::deserializeAndApply(TableStore* ts, JournalOpType type, const Stri
         u64 clLen = readU64(ptr);
         Array<Clauses> clauses;
         for (u64 i = 0; i < clLen; ++i) clauses.push(readClauses(ptr));
-        ts->remove(clauses, length);
+        ts->rm(clauses, length);
     }
     else if (type == JournalOpType::ROW_WRITE) { 
         // Obsolete graphWrite is a no-op during journal recovery

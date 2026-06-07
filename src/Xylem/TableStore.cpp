@@ -267,7 +267,7 @@ static Array<QueryStep> groupAndExpandClauses(const Array<Clauses>& clauses, Tab
                 newStep.isAssert = step.isAssert;
                 
                 Clauses c;
-                c.push({"parent_id", "=", "0"});
+                c.push({"parent_id", "=", ""});
                 newStep.groups.push(c);
                 expandedSteps.push(newStep);
             } else {
@@ -280,7 +280,7 @@ static Array<QueryStep> groupAndExpandClauses(const Array<Clauses>& clauses, Tab
                         newStep.isRepeatFollow = false;
                         
                         Clauses c;
-                        c.push({"parent_id", "=", "0"});
+                        c.push({"parent_id", "=", ""});
                         if (cleanParts[j] != "*" && cleanParts[j] != "**") {
                             auto res = resolvePathSegmentPattern(cleanParts[j]);
                             c.push({pathCol, res.op, res.val});
@@ -837,16 +837,7 @@ f32 TableStore::evaluateClause(const Map<String, String>& row, const Clause& cla
         return -1.0f;
     }
 
-    String val;
-    if (!row.has(clause.col)) {
-        if (clause.col == "parent_id") {
-            val = "0";
-        } else {
-            return -1.0f;
-        }
-    } else {
-        val = *row.get(clause.col);
-    }
+    String val = row.has(clause.col) ? *row.get(clause.col) : "";
     
     // Decrypt
     if (globalKeys) val = CryptItem::decrypt(val, *globalKeys);
@@ -867,6 +858,8 @@ f32 TableStore::evaluateClause(const Map<String, String>& row, const Clause& cla
             return -1.0f;
         }
     }
+
+    if (clause.op == "empty") return (val == "") ? 1.0f : -1.0f;
 
     if (clause.op == "=") return (val == targetVal) ? 1.0f : -1.0f;
 
@@ -949,7 +942,7 @@ f32 TableStore::evaluateClauses(const Map<String, String>& row, const Array<Clau
 // ─── Read ───────────────────────────────────────────────────────────────────
 
 Array<Map<String, String>> TableStore::read(const Array<String>& columns, const Array<Clauses>& clauses,
-                                             u64 length, bool tombstones,
+                                             u64 length, u64 page, bool tombstones,
                                              u64 snapshotSeq, u64 txId,
                                              bool readAllColumns) {
     Array<Map<String, String>> result;
@@ -978,7 +971,7 @@ Array<Map<String, String>> TableStore::read(const Array<String>& columns, const 
             idToRowId.set(idVal, rId);
         }
         
-        String pId = row->has("parent_id") ? *row->get("parent_id") : "0";
+        String pId = row->has("parent_id") ? *row->get("parent_id") : "";
         if (globalKeys) pId = CryptItem::decrypt(pId, *globalKeys);
         parentToRowIds[pId].push(rId);
     }
@@ -998,7 +991,7 @@ Array<Map<String, String>> TableStore::read(const Array<String>& columns, const 
             bool groupImpossible = false;
             for (const auto& clause : group) {
                 if ((clause.op == "=" || clause.op == "==") && !clause.val.startsWith("parent.")) {
-                    if (clause.col == "parent_id" && clause.val == "0") {
+                    if (clause.col == "parent_id" && clause.val == "") {
                         continue;
                     }
                     if (colBloomFilters.has(clause.col)) {
@@ -1021,7 +1014,7 @@ Array<Map<String, String>> TableStore::read(const Array<String>& columns, const 
             if (!inAssertPath) {
                 for (const auto& group : activeGroups) {
                     for (const auto& clause : group) {
-                        if ((clause.col == "parent_id" && clause.val == "0") || clause.op == "path") {
+                        if ((clause.col == "parent_id" && clause.val == "") || clause.op == "path") {
                             startsAssertPath = true;
                             break;
                         }
@@ -1363,7 +1356,9 @@ Array<Map<String, String>> TableStore::read(const Array<String>& columns, const 
 
         for (usz i = 0; i < outputKeys.size(); ++i) {
             String key = outputKeys[i];
-            if (!row.has(key)) continue;
+            if (!row.has(key)) {
+                continue;
+            }
 
             String rawVal = *row.get(key);
             String decryptedVal = globalKeys ? CryptItem::decrypt(rawVal, *globalKeys) : rawVal;
@@ -1375,11 +1370,12 @@ Array<Map<String, String>> TableStore::read(const Array<String>& columns, const 
                 sel.name = key;
             }
 
+            String val;
             if (sel.hasHash) {
                 if (isBlobRef(decryptedVal)) {
-                    outRow.set(key, extractBlobHash(decryptedVal));
+                    val = extractBlobHash(decryptedVal);
                 } else {
-                    outRow.set(key, Security::hash(decryptedVal, 16));
+                    val = Security::hash(decryptedVal, 16);
                 }
             } else if (sel.hasDiff) {
                 if (isBlobRef(decryptedVal) && blobStore) {
@@ -1394,16 +1390,14 @@ Array<Map<String, String>> TableStore::read(const Array<String>& columns, const 
                             String dec = CryptItem::decrypt(diffBin, *globalKeys);
                             if (!dec.isEmpty()) diffBin = dec;
                         }
-                        outRow.set(key, diffBin);
+                        val = diffBin;
                     } else {
-                        String content = blobStore->readHash(hash, 0, 0xFFFFFFFF);
-                        outRow.set(key, content);
+                        val = blobStore->readHash(hash, 0, 0xFFFFFFFF);
                     }
                 } else {
-                    outRow.set(key, decryptedVal);
+                    val = decryptedVal;
                 }
             } else if (sel.hasRange) {
-                String val;
                 if (isBlobRef(decryptedVal) && blobStore) {
                     String hash = extractBlobHash(decryptedVal);
                     u64 start = sel.range.start;
@@ -1426,15 +1420,15 @@ Array<Map<String, String>> TableStore::read(const Array<String>& columns, const 
                         val = "";
                     }
                 }
-                outRow.set(key, val);
             } else {
-                String val;
                 if (isBlobRef(decryptedVal) && blobStore) {
                     String hash = extractBlobHash(decryptedVal);
                     val = blobStore->readHash(hash, 0, 0xFFFFFFFF);
                 } else {
                     val = decryptedVal;
                 }
+            }
+            if (val != "") {
                 outRow.set(key, val);
             }
         }
@@ -1462,21 +1456,33 @@ Array<Map<String, String>> TableStore::read(const Array<String>& columns, const 
         std::sort(scored.data(), scored.data() + scored.size(), [](const ScoredRow& a, const ScoredRow& b) {
             return a.score > b.score;
         });
+        u64 skip = (page > 0) ? (page - 1) * length : 0;
+        u64 skipped = 0;
         u64 count = 0;
         for (usz i = 0; i < scored.size(); ++i) {
-            if (length > 0 && count >= length) break;
             Map<String, String>* row = fetchRow(scored[i].rId);
             if (row) {
+                if (skipped < skip) {
+                    skipped++;
+                    continue;
+                }
+                if (length > 0 && count >= length) break;
                 result.push(applySelect(*row));
                 count++;
             }
         }
     } else {
+        u64 skip = (page > 0) ? (page - 1) * length : 0;
+        u64 skipped = 0;
         u64 count = 0;
         for (usz i = 0; i < currentRows.size(); ++i) {
-            if (length > 0 && count >= length) break;
             Map<String, String>* row = fetchRow(currentRows[i]);
             if (row) {
+                if (skipped < skip) {
+                    skipped++;
+                    continue;
+                }
+                if (length > 0 && count >= length) break;
                 result.push(applySelect(*row));
                 count++;
             }
@@ -1527,18 +1533,22 @@ int TableStore::write(const Array<Clause>& columns, const Array<Clauses>& clause
             }
         }
 
-        // Check for virtual columns
-        bool hasVirtual = false;
-        Map<String, String> virtualRow; // For watcher notification
+        // Check for watch columns
+        bool hasWatch = false;
+        Map<String, String> watchRow; // For watcher notification
         
         Map<String, String> row;
         for (auto& c : columns) {
             ParsedCol pc = parseCol(c.col);
             
-            if (pc.type == ColType::VIRTUAL) {
-                hasVirtual = true;
-                virtualRow.set(pc.name, c.val);
+            if (pc.type == ColType::WATCH) {
+                hasWatch = true;
+                watchRow.set(pc.name, c.val);
                 continue;
+            }
+            
+            if (c.val == "") {
+                continue; // Do not store empty columns
             }
             
             if (pc.type == ColType::BLOB && blobStore) {
@@ -1553,9 +1563,9 @@ int TableStore::write(const Array<Clause>& columns, const Array<Clauses>& clause
             }
         }
         
-        // If ALL columns are virtual, just notify watchers, don't store
-        if (row.size() == 0 && hasVirtual) {
-            // virtualRow is passed to watchers via the engine
+        // If ALL columns are watch columns, just notify watchers, don't store
+        if (row.size() == 0 && hasWatch) {
+            // watchRow is passed to watchers via the engine
             return 0;
         }
         
@@ -1662,6 +1672,7 @@ int TableStore::write(const Array<Clause>& columns, const Array<Clauses>& clause
         Map<String, String>* row = fetchRow(rId);
         if (!row) return;
         if (evaluateClauses(*row, clauses, nullptr, rId) >= 0.0f) {
+            currentMemoryBytes -= approxRowBytes(*row);
             String keyToUse = encryptionKey;
             if (keyToUse.isEmpty() && globalKeys) {
                 for (const auto& existingCol : columns) {
@@ -1679,7 +1690,7 @@ int TableStore::write(const Array<Clause>& columns, const Array<Clauses>& clause
             
             for (const auto& col : columns) {
                 ParsedCol pc = parseCol(col.col);
-                if (pc.type == ColType::VIRTUAL) continue; // Skip virtual in updates
+                if (pc.type == ColType::WATCH) continue; // Skip watch in updates
                 
                 String oldBlobHashToDecrement;
                 if (row->has(pc.name)) {
@@ -1709,7 +1720,12 @@ int TableStore::write(const Array<Clause>& columns, const Array<Clauses>& clause
                     }
                 }
 
-                if (pc.type == ColType::BLOB && blobStore) {
+                if (col.val == "") {
+                    // Setting a column to "" means removing that column
+                    if (row->has(pc.name)) {
+                        row->remove(pc.name);
+                    }
+                } else if (pc.type == ColType::BLOB && blobStore) {
                     String content = col.val;
                     // Handle partial blob writes
                     if (pc.rangeSpec.size() > 0) {
@@ -1728,8 +1744,8 @@ int TableStore::write(const Array<Clause>& columns, const Array<Clauses>& clause
                     row->set(pc.name, keyToUse.isEmpty() ? col.val : CryptItem::encrypt(col.val, keyToUse));
                 }
 
-                // Add newVal to colHashIndex[pc.name][newVal]
-                if (!colHashIndexDirty && pc.name != "content" && row->has(pc.name)) {
+                // Add newVal to colHashIndex[pc.name][newVal] (only if column was not removed)
+                if (col.val != "" && !colHashIndexDirty && pc.name != "content" && row->has(pc.name)) {
                     String newVal = *row->get(pc.name);
                     if (newVal.size() <= 256) {
                         if (globalKeys) newVal = CryptItem::decrypt(newVal, *globalKeys);
@@ -1780,7 +1796,7 @@ int TableStore::write(const Array<Clause>& columns, const Array<Clauses>& clause
 
 // ─── Remove ─────────────────────────────────────────────────────────────────
 
-bool TableStore::remove(const Array<Clauses>& clauses, u64 length) {
+bool TableStore::rm(const Array<Clauses>& clauses, u64 length) {
     resolvePathsInClauses(clauses, currentSeq, 0);
 
     Array<u64> toRemove;
@@ -1977,6 +1993,12 @@ void TableStore::serializeBlock(u64 blockId, String& out, bool volatileOnly) {
     u32 rowCount = rowIds.size();
     if (rowCount == 0) return;
     
+    Array<Map<String, String>*> rows;
+    rows.allocate(rowCount);
+    for (u32 i = 0; i < rowCount; ++i) {
+        rows[i] = fetchRow(rowIds[i]);
+    }
+    
     auto writeVLU = [](String& str, u64 val) {
         while (val >= 0x80) {
             str += (char)((val & 0x7F) | 0x80);
@@ -1987,7 +2009,7 @@ void TableStore::serializeBlock(u64 blockId, String& out, bool volatileOnly) {
     
     Array<String> colNames;
     for (u32 i = 0; i < rowCount; ++i) {
-        Map<String, String>* row = fetchRow(rowIds[i]);
+        Map<String, String>* row = rows[i];
         if (row) {
             for (auto it = row->begin(); it != row->end(); ++it) {
                 bool found = false;
@@ -2018,12 +2040,12 @@ void TableStore::serializeBlock(u64 blockId, String& out, bool volatileOnly) {
         payload += (char)TypeTag::STRING;
         
         for (u32 i = 0; i < rowCount; ++i) {
-            Map<String, String>* row = fetchRow(rowIds[i]);
+            Map<String, String>* row = rows[i];
             String val = (row && row->has(name)) ? *row->get(name) : String();
             writeVLU(payload, val.size());
         }
         for (u32 i = 0; i < rowCount; ++i) {
-            Map<String, String>* row = fetchRow(rowIds[i]);
+            Map<String, String>* row = rows[i];
             String val = (row && row->has(name)) ? *row->get(name) : String();
             payload += val;
         }
@@ -2149,11 +2171,12 @@ void TableStore::deserializeBlock(u64 blockId, const String& in, bool isVolatile
     }
     
     for (u32 i = 0; i < rowCount; ++i) {
-        if (rows[i].size() > 0) {
-            allRows.set(rowIds[i], rows[i]);
-            if (isVolatile) volatileRows.set(rowIds[i], true);
-            currentMemoryBytes += approxRowBytes(rows[i]);
+        if (allRows.has(rowIds[i])) {
+            currentMemoryBytes -= approxRowBytes(*allRows.get(rowIds[i]));
         }
+        allRows.set(rowIds[i], rows[i]);
+        if (isVolatile) volatileRows.set(rowIds[i], true);
+        currentMemoryBytes += approxRowBytes(rows[i]);
     }
 }
 
@@ -2176,7 +2199,7 @@ Array<u64> TableStore::resolvePathPattern(const String& colName, const String& p
     }
     
     Array<String> currentParentVals;
-    currentParentVals.push("0");
+    currentParentVals.push("");
 
     Map<String, u64> idToRowId;
     Map<String, Array<u64>> parentToRowIds;
@@ -2191,7 +2214,7 @@ Array<u64> TableStore::resolvePathPattern(const String& colName, const String& p
             idToRowId.set(idVal, rId);
         }
         
-        String pId = row->has("parent_id") ? *row->get("parent_id") : "0";
+        String pId = row->has("parent_id") ? *row->get("parent_id") : "";
         if (globalKeys) pId = CryptItem::decrypt(pId, *globalKeys);
         parentToRowIds[pId].push(rId);
     }

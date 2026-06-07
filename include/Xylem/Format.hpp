@@ -27,7 +27,7 @@ enum class TypeTag : u8 {
     STRING_N = 0x0D,
     BLOB = 0x0E,
     TREE = 0x0F,
-    VIRTUAL = 0x10,
+    WATCH = 0x10,
     TENSOR = 0x11,
     UNKNOWN = 0x12,
     UNKNOWN_N = 0x13,

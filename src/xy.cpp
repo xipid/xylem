@@ -72,7 +72,7 @@ RowNode *getDeepestRowNode(TreeItem *item) {
 
 String getPathId(XylemEngine &xm, const String &absolutePath) {
   if (absolutePath == "/" || absolutePath.isEmpty()) {
-    return "0";
+    return "";
   }
   Array<String> parts = absolutePath.split("/");
   Array<String> cleanParts;
@@ -82,9 +82,9 @@ String getPathId(XylemEngine &xm, const String &absolutePath) {
     }
   }
   if (cleanParts.size() == 0)
-    return "0";
+    return "";
 
-  String currentId = "0";
+  String currentId = "";
   for (usz i = 0; i < cleanParts.size(); ++i) {
     String query = "READ id WHERE parent_id=%1 name=%2";
     Array<String> args;
@@ -102,10 +102,10 @@ String getPathId(XylemEngine &xm, const String &absolutePath) {
 bool getPathRow(XylemEngine &xm, const String &absolutePath,
                 Map<String, String> &outRow) {
   if (absolutePath == "/" || absolutePath.isEmpty()) {
-    outRow.set("id", "0");
+    outRow.set("id", "");
     outRow.set("type", "dir");
     outRow.set("name", "");
-    outRow.set("parent_id", "0");
+    outRow.set("parent_id", "");
     return true;
   }
   String id = getPathId(xm, absolutePath);
@@ -133,7 +133,7 @@ void recursiveRemove(XylemEngine &xm, const String &id) {
       recursiveRemove(xm, *row.get("id"));
     }
   }
-  String delQ = "REMOVE WHERE id=%1";
+  String delQ = "RM WHERE id=%1";
   Array<String> delArgs;
   delArgs.push(id);
   xm.query(delQ, delArgs);
@@ -295,14 +295,17 @@ int main(int argc, char **argv) {
     return buf;
   };
   xm.config.onDeviceWrite = [fd](u64 offset, String data) -> bool {
-    return pwrite(fd, data.data(), data.size(), offset) == (ssize_t)data.size();
+    bool ok = pwrite(fd, data.data(), data.size(), offset) == (ssize_t)data.size();
+    if (ok) fdatasync(fd);
+    return ok;
   };
   xm.config.onDeviceErase = [fd](u64 offset, u64 maxOffset) -> bool {
     String empty;
     empty.allocate(maxOffset - offset);
     empty.fill(0xFF);
-    pwrite(fd, empty.data(), empty.size(), offset);
-    return true;
+    bool ok = pwrite(fd, empty.data(), empty.size(), offset) == (ssize_t)empty.size();
+    if (ok) fdatasync(fd);
+    return ok;
   };
 
   // Auto Mount (format if it fails)
@@ -368,7 +371,7 @@ int main(int argc, char **argv) {
               if (!parts[i].isEmpty())
                 cleanParts.push(parts[i]);
 
-            String currentParentId = "0";
+            String currentParentId = "";
             for (usz i = 0; i < cleanParts.size(); ++i) {
               String partName = cleanParts[i];
               String q = "READ id WHERE name=%1 parent_id=%2";
@@ -454,7 +457,7 @@ int main(int argc, char **argv) {
       progress.update();
 
       Map<String, String> dirCache;
-      dirCache.set("0", "0");
+      dirCache.set("/", "");
       Array<String> newDirs;
 
       u64 txId = xm.lock(Array<Clauses>(), 0, false);
@@ -481,7 +484,7 @@ int main(int argc, char **argv) {
           if (cleanParts.size() == 0)
             return;
 
-          String currentParentId = "0";
+          String currentParentId = "";
           String currentPathStr = "/";
 
           // Create directory structure if missing (using cache)
@@ -709,7 +712,7 @@ int main(int argc, char **argv) {
           bool isRootFile = false;
           
           while (curr) {
-            String pId = curr->has("parent_id") ? *curr->get("parent_id") : "0";
+            String pId = curr->has("parent_id") ? *curr->get("parent_id") : "";
             if (!rowMap.has(pId)) {
               // curr is a root node
               String currType = curr->has("type") ? *curr->get("type") : "";
@@ -762,8 +765,8 @@ int main(int argc, char **argv) {
     }
 
     // Intercept path commands to apply pwd
-    if (cmd == "LS" || cmd == "CAT" || cmd == "UNLINK") {
-      if (tokens.size() > 1) {
+    if (cmd == "LS" || cmd == "CAT" || cmd == "RM") {
+      if (tokens.size() > 1 && (cmd != "RM" || tokens[1].startsWith("/") || tokens[1].startsWith("./") || tokens[1] == ".")) {
         String targetPath = resolvePath(pwd, tokens[1]);
         line = cmd + " \"" + targetPath + "\"";
         for (usz i = 2; i < tokens.size(); ++i) {
@@ -780,13 +783,25 @@ int main(int argc, char **argv) {
           line += " " + tokens[i];
         }
       }
+    } else if (cmd == "CP" || cmd == "MV") {
+      if (tokens.size() > 2) {
+        String srcPath = resolvePath(pwd, tokens[1]);
+        String dstPath = resolvePath(pwd, tokens[2]);
+        line = cmd + " \"" + srcPath + "\" \"" + dstPath + "\"";
+        for (usz i = 3; i < tokens.size(); ++i) {
+          line += " " + tokens[i];
+        }
+      } else {
+        printf("Error: %s requires <src> <dst>\n", cmd.c_str());
+        continue;
+      }
     }
 
     // Pass any other command directly to the Query Parser
     QueryResult res = xm.query(line);
     printResult(res);
-    if (cmd == "WRITE" || cmd == "WRITEVOLATILE" || cmd == "REMOVE" ||
-        cmd == "TEE" || cmd == "UNLINK") {
+    if (cmd == "WRITE" || cmd == "WRITEVOLATILE" || cmd == "RM" ||
+        cmd == "TEE") {
       // xm.flush() is now done internally instantly by XylemEngine.
     }
 

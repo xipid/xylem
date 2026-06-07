@@ -22,8 +22,8 @@ int main() {
 
   // Test 1: Format/Mount & File I/O Hook
   Info("Test 1: Format & Mount (Archive Storage POSIX)");
-  unlink("db.xy"); // Ensure clean state across test runs
-  int fd = open("db.xy", O_RDWR | O_CREAT, 0644);
+  unlink("/tmp/db.xy"); // Ensure clean state across test runs
+  int fd = open("/tmp/db.xy", O_RDWR | O_CREAT, 0644);
 
   xm.config.onDeviceRead = [fd](u64 offset, u64 maxOffset) -> String {
     String buf;
@@ -136,26 +136,26 @@ int main() {
   else
     Error("writeHash(content, hash) failed!");
 
-  // Test 7: Virtual Columns (Ephemeral Messaging) — using :virtual suffix
-  Info("Test 7: Virtual Columns (Ephemeral Messaging)");
+  // Test 7: Watch Columns (Ephemeral Messaging) — using :watch suffix
+  Info("Test 7: Watch Columns (Ephemeral Messaging)");
   u64 inbox = xm.watch(OR(WHERE("_type", "=", "command")));
   Array<Clause> ev;
   ev.push({"event_type", "=", "USER_LOGIN"});
   xm.write(ev, Array<Clauses>(), 0, "RIGOROUS_SECURE_TEST_KEY_32BYTES");
   Array<Clause> cmdRow;
-  cmdRow.push({"_type:virtual", "=", "command"});
-  cmdRow.push({"action:virtual", "=", "reboot"});
+  cmdRow.push({"_type:watch", "=", "command"});
+  cmdRow.push({"action:watch", "=", "reboot"});
   xm.write(cmdRow);
   auto cmds = xm.pull(inbox);
-  Info("Virtual commands received: " + String::from((u64)cmds.size()) +
+  Info("Watch commands received: " + String::from((u64)cmds.size()) +
        " (Expected: 1)");
 
-  // Verify virtual columns were NOT stored
-  auto virtualCheck = xm.read(cols, OR(WHERE("_type", "=", "command")));
-  if (virtualCheck.size() == 0)
-    Success("Virtual columns correctly not stored in DB.");
+  // Verify watch columns were NOT stored
+  auto watchCheck = xm.read(cols, OR(WHERE("_type", "=", "command")));
+  if (watchCheck.size() == 0)
+    Success("Watch columns correctly not stored in DB.");
   else
-    Error("Virtual columns were incorrectly stored!");
+    Error("Watch columns were incorrectly stored!");
 
   // Test 7.1: :blob column type (transparent storage)
   Info("Test 7.1: Blob Column Type (Transparent Storage)");
@@ -279,8 +279,8 @@ int main() {
        " ms (lazy ingestion, no graph ops).");
 
   struct stat st;
-  stat("db.xy", &st);
-  Info("Physical db.xy payload size: " + String::from((u64)st.st_size) +
+  stat("/tmp/db.xy", &st);
+  Info("Physical /tmp/db.xy payload size: " + String::from((u64)st.st_size) +
        " bytes (ZSTD Compression + Encryption Active)");
 
   Info("Executing Top-5 Cosine Similarity Search (triggers on-demand "
@@ -302,7 +302,7 @@ int main() {
   }
 
   Info("Test 10.1: Instantaneous Removal");
-  xm.remove(OR(WHERE("v_id", "=", String::from((u64)perfectIdx))));
+  xm.rm(OR(WHERE("v_id", "=", String::from((u64)perfectIdx))));
   Info("Deleted Perfect Match. Searching again...");
 
   topRows = xm.read(retCols, OR(WHERE("embedding", "cos", targetVecStr)), 5);
@@ -485,7 +485,7 @@ int main() {
   String refHash = Security::hash(sharedBlob, 16);
 
   // Delete one — blob should survive (still referenced by ref2)
-  xm.remove(OR(WHERE("ref_id", "=", "ref1")));
+  xm.rm(OR(WHERE("ref_id", "=", "ref1")));
   u32 afterDel1Ref = xm.getBlobRef(refHash);
   u32 afterDel1Sz = xm.getBlobSize(afterDel1Ref);
   if (afterDel1Sz > 0)
@@ -494,7 +494,7 @@ int main() {
     Error("Blob was prematurely deleted!");
 
   // Delete the other — blob should now be cleaned up
-  xm.remove(OR(WHERE("ref_id", "=", "ref2")));
+  xm.rm(OR(WHERE("ref_id", "=", "ref2")));
   u32 afterDel2Ref = xm.getBlobRef(refHash);
   u32 afterDel2Sz = xm.getBlobSize(afterDel2Ref);
   if (afterDel2Sz == 0)
@@ -524,7 +524,231 @@ int main() {
     Success("Volatile row successfully vanished after destroy/power-loss!");
   else
     Error("Volatile row incorrectly persisted to disk!");
-  Success("All rigorous tests successfully passed!");
+
+  // --- Ported Rigorous & New Feature Tests ---
+  Info("--- Ported Rigorous & New Feature Tests ---");
+
+  // A. Ported Rigorous: Malformed & Missing Columns
+  Array<Clause> rM1;
+  rM1.push({"exists", "=", "yes"});
+  xm.write(rM1);
+  auto resM1 = xm.read({}, OR(WHERE("does_not_exist", "=", "yes")));
+  if (resM1.size() != 0)
+    Error("Ported Test 1 Failed: Returned data for missing column.");
+  else
+    Success("Ported Test 1 Passed: Handled missing column gracefully.");
+
+  // B. Ported Rigorous: Transaction Rollback Thrashing
+  u64 txFail = xm.lock(OR(WHERE("id", "=", "thrash")));
+  Array<Clause> rM2;
+  rM2.push({"id", "=", "thrash"});
+  xm.write(rM2, Array<Clauses>(), txFail);
+  xm.rollback(txFail);
+  auto resM2 = xm.read({}, OR(WHERE("id", "=", "thrash")));
+  if (resM2.size() != 0)
+    Error("Ported Test 2 Failed: Rolled back data was found!");
+  else
+    Success("Ported Test 2 Passed: Rollback successfully purged data.");
+
+  // C. Ported Rigorous: Vector dimension mismatch
+  String badVec;
+  badVec.allocate(127 * sizeof(f32));
+  Array<Clause> rM3;
+  rM3.push({"v_id", "=", "bad"});
+  rM3.push({"embedding", "=", badVec});
+  xm.write(rM3);
+  String goodQuery;
+  goodQuery.allocate(128 * sizeof(f32));
+  auto resM3 = xm.read({}, OR(WHERE("embedding", "cos", goodQuery)));
+  Success("Ported Test 3 Passed: Engine survived malformed vector dimensions without segfaulting.");
+
+  // D. Ported Rigorous: Watcher mid-stream unsubscribe
+  Info("Ported Test 4: Starting watch");
+  u64 watchId = xm.watch(OR(WHERE("type", "=", "spam")));
+  Info("Ported Test 4: Entering loop 1");
+  for (int i = 0; i < 50; ++i) {
+    Info("Ported Test 4: Loop 1 iteration " + String::from((u64)i));
+    Array<Clause> spam;
+    spam.push({"type", "=", "spam"});
+    xm.write(spam);
+  }
+  Info("Ported Test 4: Unwatching");
+  xm.unwatch(watchId);
+  Info("Ported Test 4: Entering loop 2");
+  for (int i = 0; i < 50; ++i) {
+    Info("Ported Test 4: Loop 2 iteration " + String::from((u64)i));
+    Array<Clause> spam;
+    spam.push({"type", "=", "spam"});
+    xm.write(spam);
+  }
+  Success("Ported Test 4 Passed: Watcher unsubscribe survived spam.");
+
+  // E. Ported Rigorous: HNSW graph collapse
+  usz numV = 100;
+  usz dimV = 32;
+  for (usz i = 0; i < numV; ++i) {
+    String vecStr;
+    vecStr.allocate(dimV * sizeof(f32));
+    Array<Clause> row;
+    row.push({"v_id", "=", String::from((u64)i)});
+    row.push({"type", "=", "vector_collapse"});
+    row.push({"embedding", "=", vecStr});
+    xm.write(row);
+  }
+  String dummyQV;
+  dummyQV.allocate(dimV * sizeof(f32));
+  xm.read({}, OR(WHERE("embedding", "cos", dummyQV)), 5);
+  xm.rm(OR(WHERE("type", "=", "vector_collapse")));
+  auto resM5 = xm.read({}, OR(WHERE("embedding", "cos", dummyQV)), 5);
+  if (resM5.size() != 0)
+    Error("Ported Test 5 Failed: Graph returned deleted vectors.");
+  else
+    Success("Ported Test 5 Passed: Graph survived total collapse and returned 0 results.");
+
+  // F. Ported Rigorous: CAS blob dedup stress test
+  String largeP;
+  largeP.allocate(10 * 1024);
+  largeP.fill('X');
+  String hP1 = Security::hash(largeP, 16);
+  for (int i = 0; i < 10; ++i) {
+    xm.writeHash(largeP);
+  }
+  u32 blobRefP = xm.getBlobRef(hP1);
+  u32 blobSzP = xm.getBlobSize(blobRefP);
+  if (blobSzP == 10240)
+    Success("Ported Test 6 Passed: CAS blob dedup verified.");
+  else
+    Error("Ported Test 6 Failed: CAS blob dedup size mismatch.");
+
+  // G. New Feature: Empty/absent columns and setting to ""
+  Info("Testing empty/absent columns and setting to \"\"");
+  Array<Clause> emptyColRow;
+  emptyColRow.push({"id", "=", "empty_col_test"});
+  emptyColRow.push({"exists", "=", "yes"});
+  emptyColRow.push({"empty_val", "=", ""});
+  xm.write(emptyColRow);
+
+  Array<String> getCols;
+  getCols.push("exists");
+  getCols.push("empty_val");
+  getCols.push("absent_col");
+  auto getRes = xm.read(getCols, OR(WHERE("id", "=", "empty_col_test")));
+  if (getRes.size() == 1 && getRes[0]["exists"] == "yes" && getRes[0]["empty_val"] == "" && getRes[0]["absent_col"] == "") {
+    Success("Empty/absent columns returned empty string successfully.");
+  } else {
+    Error("Empty/absent columns retrieval failed.");
+  }
+
+  // Verify query evaluator treats absent/empty column as ""
+  auto checkEmptyVal = xm.read({}, OR(WHERE("empty_val", "=", "") && WHERE("id", "=", "empty_col_test")));
+  auto checkAbsentCol = xm.read({}, OR(WHERE("absent_col", "=", "") && WHERE("id", "=", "empty_col_test")));
+  if (checkEmptyVal.size() == 1 && checkAbsentCol.size() == 1) {
+    Success("Query evaluator treats empty/absent columns as empty string successfully.");
+  } else {
+    Error("Query evaluator failed to match empty/absent column as empty string.");
+  }
+
+  // Setting a column to "" removes it
+  Array<Clause> updateEmptyRow;
+  updateEmptyRow.push({"exists", "=", ""});
+  xm.write(updateEmptyRow, OR(WHERE("id", "=", "empty_col_test")));
+  Array<String> existsCol;
+  existsCol.push("exists");
+  auto checkRemovedCol = xm.read(existsCol, OR(WHERE("id", "=", "empty_col_test")));
+  if (checkRemovedCol.size() == 1 && checkRemovedCol[0]["exists"] == "") {
+    Success("Setting a column to empty string successfully removed it.");
+  } else {
+    Error("Failed to remove column by setting it to empty string.");
+  }
+
+  // H. New Feature: Empty operator
+  Info("Testing 'empty' operator");
+  auto checkEmptyOp = xm.read({}, OR(WHERE("exists", "empty", "") && WHERE("id", "=", "empty_col_test")));
+  if (checkEmptyOp.size() == 1) {
+    Success("'empty' operator matched empty/absent column successfully.");
+  } else {
+    Error("'empty' operator failed to match empty/absent column.");
+  }
+
+  // I. New Feature: Range slicing syntax parsing for CAT and TEE
+  Info("Testing range slicing syntax in VFS path");
+  // Tee some data
+  xm.tee("/range_test.txt", "0123456789");
+  // Read using slices
+  QueryResult slice1 = xm.cat("/range_test.txt[2:5]"); // "234"
+  QueryResult slice2 = xm.cat("/range_test.txt[5:]");  // "56789"
+  QueryResult slice3 = xm.cat("/range_test.txt[:5]");  // "01234"
+  QueryResult slice4 = xm.cat("/range_test.txt[4]");   // "4"
+  
+  if (slice1.readRows.size() > 0 && *slice1.readRows[0].get("content") == "234" &&
+      slice2.readRows.size() > 0 && *slice2.readRows[0].get("content") == "56789" &&
+      slice3.readRows.size() > 0 && *slice3.readRows[0].get("content") == "01234" &&
+      slice4.readRows.size() > 0 && *slice4.readRows[0].get("content") == "4") {
+    Success("VFS path range slicing in cat/tee works perfectly.");
+  } else {
+    Error("VFS path range slicing in cat/tee failed!");
+  }
+
+  // J. New Feature: cp and mv commands
+  Info("Testing cp and mv commands");
+  xm.cp("/range_test.txt", "/copied_range.txt");
+  QueryResult checkCp = xm.cat("/copied_range.txt");
+  if (checkCp.readRows.size() > 0 && *checkCp.readRows[0].get("content") == "0123456789") {
+    Success("cp command copied file successfully.");
+  } else {
+    Error("cp command failed!");
+  }
+
+  xm.mv("/copied_range.txt", "/moved_range.txt");
+  QueryResult checkMv1 = xm.cat("/copied_range.txt");
+  QueryResult checkMv2 = xm.cat("/moved_range.txt");
+  if (checkMv1.readRows.size() == 0 && checkMv2.readRows.size() > 0 && *checkMv2.readRows[0].get("content") == "0123456789") {
+    Success("mv command moved file successfully.");
+  } else {
+    Error("mv command failed!");
+  }
+
+  // K. New Feature: Pagination (limit and page)
+  Info("Testing pagination (limit x page y)");
+  // Insert 5 rows
+  for (int i = 1; i <= 5; ++i) {
+    Array<Clause> pagRow;
+    pagRow.push({"id", "=", String::from((u64)(1000 + i))});
+    pagRow.push({"tag", "=", "pag_test"});
+    pagRow.push({"val", "=", String::from((u64)i)});
+    xm.write(pagRow);
+  }
+  
+  // Read back with pagination (limit 2 page 1) -> should return 1, 2
+  Array<String> valCol; valCol.push("val");
+  auto pagRes1 = xm.read(valCol, OR(WHERE("tag", "=", "pag_test")), 2, 1);
+  // Read back with pagination (limit 2 page 2) -> should return 3, 4
+  auto pagRes2 = xm.read(valCol, OR(WHERE("tag", "=", "pag_test")), 2, 2);
+  // Read back with pagination (limit 2 page 3) -> should return 5
+  auto pagRes3 = xm.read(valCol, OR(WHERE("tag", "=", "pag_test")), 2, 3);
+
+  if (pagRes1.size() == 2 && pagRes1[0]["val"] == "1" && pagRes1[1]["val"] == "2" &&
+      pagRes2.size() == 2 && pagRes2[0]["val"] == "3" && pagRes2[1]["val"] == "4" &&
+      pagRes3.size() == 1 && pagRes3[0]["val"] == "5") {
+    Success("Pagination API (limit and page) works perfectly.");
+  } else {
+    Error("Pagination API (limit and page) failed!");
+  }
+
+  // Query parser pagination (using LIMIT and PAGE clauses)
+  QueryResult qPag1 = xm.query("READ val WHERE tag='pag_test' LIMIT 2 PAGE 1");
+  QueryResult qPag2 = xm.query("READ val WHERE tag='pag_test' LIMIT 2 PAGE 2");
+  QueryResult qPag3 = xm.query("READ val WHERE tag='pag_test' LIMIT 2 PAGE 3");
+
+  if (qPag1.readRows.size() == 2 && qPag1.readRows[0]["val"] == "1" && qPag1.readRows[1]["val"] == "2" &&
+      qPag2.readRows.size() == 2 && qPag2.readRows[0]["val"] == "3" && qPag2.readRows[1]["val"] == "4" &&
+      qPag3.readRows.size() == 1 && qPag3.readRows[0]["val"] == "5") {
+    Success("Query Parser pagination (LIMIT and PAGE) works perfectly.");
+  } else {
+    Error("Query Parser pagination (LIMIT and PAGE) failed!");
+  }
+
+  Success("All tests successfully completed!");
   xm.destroy();
   close(fd);
 
