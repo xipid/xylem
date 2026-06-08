@@ -115,6 +115,95 @@ static bool matchPattern(const String& segVal, const String& pattern) {
     return segVal == unescaped;
 }
 
+static String globToRegexPath(const String& glob) {
+    String re;
+    for (usz i = 0; i < glob.size(); ++i) {
+        char c = glob[i];
+        if (c == '\\') {
+            if (i + 1 < glob.size()) {
+                char next = glob[i+1];
+                if (next == '*') {
+                    re += "\\*";
+                    i++;
+                } else if (next == '?') {
+                    re += "\\?";
+                    i++;
+                } else {
+                    re += "\\\\";
+                }
+            } else {
+                re += "\\\\";
+            }
+        } else if (c == '*') {
+            if (i + 1 < glob.size() && glob[i+1] == '*') {
+                re += ".*";
+                i++;
+            } else {
+                re += "[^/]*";
+            }
+        } else if (c == '?') {
+            re += "[^/]";
+        } else if (c == '.' || c == '+' || c == '(' || c == ')' || c == '[' || c == ']' ||
+                   c == '{' || c == '}' || c == '^' || c == '$' || c == '|' || c == '$') {
+            re += "\\";
+            re += c;
+        } else {
+            re += c;
+        }
+    }
+    return re;
+}
+
+static bool matchPathPattern(const String& segVal, const String& pattern) {
+    if (isRegexSyntax(pattern)) {
+        try {
+            std::string sv((const char*)segVal.data(), segVal.size());
+            std::string pt((const char*)pattern.data(), pattern.size());
+            std::regex re(pt);
+            return std::regex_match(sv, re);
+        } catch (...) {
+        }
+    }
+    
+    bool hasGlob = false;
+    for (usz i = 0; i < pattern.size(); ++i) {
+        if (pattern[i] == '\\') {
+            i++;
+        } else if (pattern[i] == '*' || pattern[i] == '?') {
+            hasGlob = true;
+            break;
+        }
+    }
+    
+    if (hasGlob) {
+        String reStr = globToRegexPath(pattern);
+        try {
+            std::string sv((const char*)segVal.data(), segVal.size());
+            std::string pt((const char*)reStr.data(), reStr.size());
+            std::regex re(pt);
+            return std::regex_match(sv, re);
+        } catch (...) {
+        }
+    }
+    
+    String unescaped;
+    for (usz i = 0; i < pattern.size(); ++i) {
+        char c = pattern[i];
+        if (c == '\\') {
+            if (i + 1 < pattern.size()) {
+                unescaped += (char)pattern[i+1];
+                i++;
+            } else {
+                unescaped += '\\';
+            }
+        } else {
+            unescaped += c;
+        }
+    }
+    return segVal == unescaped;
+}
+
+
 struct ColSelection {
     String name;
     bool hasRange = false;
@@ -231,7 +320,7 @@ static Array<QueryStep> groupAndExpandClauses(const Array<Clauses>& clauses, Tab
     for (usz i = 0; i < rawSteps.size(); ++i) {
         const QueryStep& step = rawSteps[i];
         
-        bool hasPathOp = false;
+        bool hasPathOp = false; // Disabled expansion so precomputed wildcard paths are evaluated directly
         String pathCol;
         String pathPattern;
         usz pathGroupIdx = 0;
@@ -240,7 +329,6 @@ static Array<QueryStep> groupAndExpandClauses(const Array<Clauses>& clauses, Tab
         for (usz gi = 0; gi < step.groups.size(); ++gi) {
             for (usz ci = 0; ci < step.groups[gi].size(); ++ci) {
                 if (step.groups[gi][ci].op == "path") {
-                    hasPathOp = true;
                     pathCol = step.groups[gi][ci].col;
                     pathPattern = step.groups[gi][ci].val;
                     pathGroupIdx = gi;
@@ -248,7 +336,6 @@ static Array<QueryStep> groupAndExpandClauses(const Array<Clauses>& clauses, Tab
                     break;
                 }
             }
-            if (hasPathOp) break;
         }
         
         if (hasPathOp) {
@@ -344,6 +431,7 @@ TableStore::TableStore(BlockDevice* dev, Allocator* alloc, Array<String>* keys)
     : device(dev), allocator(alloc), globalKeys(keys) {}
 
 Array<u64> TableStore::getMatchingRowIds(const Array<Clauses>& clauses, u64 snapshotSeq, u64 txId) {
+    resolvePathsInClauses(clauses, snapshotSeq, txId);
     Array<u64> result;
     Array<u64> candidateIds;
     bool fastPathUsed = false;
@@ -387,10 +475,15 @@ Array<u64> TableStore::getMatchingRowIds(const Array<Clauses>& clauses, u64 snap
 
     const Array<u64>& scanList = fastPathUsed ? candidateIds : allRowIds;
     for (u64 rId : scanList) {
-        if (!isVisibleToSnapshot(rId, snapshotSeq, txId)) continue;
+        if (!isVisibleToSnapshot(rId, snapshotSeq, txId)) {
+            continue;
+        }
         Map<String, String>* row = fetchRow(rId);
-        if (row && evaluateClauses(*row, clauses, nullptr, rId) >= 0.0f) {
-            result.push(rId);
+        if (row) {
+            f32 score = evaluateClauses(*row, clauses, nullptr, rId);
+            if (score >= 0.0f) {
+                result.push(rId);
+            }
         }
     }
     return result;
@@ -823,18 +916,56 @@ void TableStore::gcVersions(u64 oldestActiveSnapshot) {
     }
 }
 
+static bool isRowUnderPerms(u64 rId, TableStore* store) {
+    if (rId == 0) return false;
+    u64 currentId = rId;
+    int depth = 0;
+    while (currentId != 0 && depth < 10) {
+        Map<String, String>* row = store->fetchRow(currentId);
+        if (!row) break;
+        String name = row->has("name") ? *row->get("name") : "";
+        String pId = row->has("parent_id") ? *row->get("parent_id") : "";
+        if (name == "perms" && pId.isEmpty()) {
+            return true;
+        }
+        if (pId.isEmpty()) break;
+        
+        u64 parentIdRId = 0;
+        if (store->colHashIndexDirty) {
+            const_cast<TableStore*>(store)->rebuildColHashIndex();
+        }
+        auto* valMap = store->colHashIndex.get("id");
+        if (valMap && valMap->has(pId)) {
+            const auto& rIds = *valMap->get(pId);
+            if (rIds.size() > 0) {
+                parentIdRId = rIds[0];
+            }
+        }
+        if (parentIdRId == 0) break;
+        currentId = parentIdRId;
+        depth++;
+    }
+    return false;
+}
+
 // ─── Clause Evaluation ─────────────────────────────────────────────────────
 
 f32 TableStore::evaluateClause(const Map<String, String>& row, const Clause& clause, const Map<String, String>* parentRow, u64 rId) {
     if (clause.op == "path") {
         String key = clause.col + "::" + clause.val;
         auto* ids = precomputedPaths.get(key);
+        Array<u64> tempIds;
+        if (!ids) {
+            tempIds = resolvePathPattern(clause.col, clause.val, 0, 0);
+            ids = &tempIds;
+        }
+        f32 res = -1.0f;
         if (ids) {
             for (usz i = 0; i < ids->size(); ++i) {
-                if ((*ids)[i] == rId) return 1.0f;
+                if ((*ids)[i] == rId) { res = 1.0f; break; }
             }
         }
-        return -1.0f;
+        return res;
     }
 
     String val = row.has(clause.col) ? *row.get(clause.col) : "";
@@ -859,9 +990,16 @@ f32 TableStore::evaluateClause(const Map<String, String>& row, const Clause& cla
         }
     }
 
-    if (clause.op == "empty") return (val == "") ? 1.0f : -1.0f;
-
-    if (clause.op == "=") return (val == targetVal) ? 1.0f : -1.0f;
+    f32 score = -1.0f;
+    if (clause.op == "empty") score = (val == "") ? 1.0f : -1.0f;
+    else if (clause.op == "=") score = (val == targetVal) ? 1.0f : -1.0f;
+    else if (clause.op == "!=") score = (val != targetVal) ? 1.0f : -1.0f;
+    else if (clause.op == "has") score = (val.indexOf(targetVal) >= 0) ? 1.0f : -1.0f;
+    else if (clause.op == "!has") score = (val.indexOf(targetVal) < 0) ? 1.0f : -1.0f;
+ 
+    if (clause.op == "empty" || clause.op == "=" || clause.op == "!=" || clause.op == "has" || clause.op == "!has") {
+        return score;
+    }
 
     if (clause.op == "hash") {
         return (Security::hash(val, 16) == targetVal) ? 1.0f : -1.0f;
@@ -920,6 +1058,36 @@ f32 TableStore::evaluateClause(const Map<String, String>& row, const Clause& cla
 
 f32 TableStore::evaluateClauses(const Map<String, String>& row, const Array<Clauses>& clausesGroups, const Map<String, String>* parentRow, u64 rId) {
     if (clausesGroups.size() == 0) return 1.0f;
+    
+    if (rId == 0 && row.has("id")) {
+        String explicitId = *row.get("id");
+        if (colHashIndexDirty) {
+            rebuildColHashIndex();
+        }
+        auto* valMap = colHashIndex.get("id");
+        if (valMap && valMap->has(explicitId)) {
+            const auto& rIds = *valMap->get(explicitId);
+            if (rIds.size() > 0) {
+                rId = rIds[0];
+            }
+        }
+    }
+    
+    bool isPermQuery = false;
+    for (const auto& group : clausesGroups) {
+        for (const auto& clause : group) {
+            if (clause.val.startsWith("/perms/") || clause.val.startsWith("perms/")) {
+                isPermQuery = true;
+                break;
+            }
+        }
+        if (isPermQuery) break;
+    }
+    
+    if (!isPermQuery && isRowUnderPerms(rId, this)) {
+        return -1.0f;
+    }
+    
     f32 maxScore = -1.0f;
     for (const auto& group : clausesGroups) {
         f32 groupMinScore = 1.0f;
@@ -945,6 +1113,7 @@ Array<Map<String, String>> TableStore::read(const Array<String>& columns, const 
                                              u64 length, u64 page, bool tombstones,
                                              u64 snapshotSeq, u64 txId,
                                              bool readAllColumns) {
+    resolvePathsInClauses(clauses, snapshotSeq, txId);
     Array<Map<String, String>> result;
 
     if (colBloomFiltersDirty) rebuildBloomFilters();
@@ -1323,10 +1492,15 @@ Array<Map<String, String>> TableStore::read(const Array<String>& columns, const 
 
             const Array<u64>& scanList = fastPathUsed ? candidates : allRowIds;
             for (u64 rId : scanList) {
-                if (!isVisibleToSnapshot(rId, snapshotSeq, txId)) continue;
+                if (!isVisibleToSnapshot(rId, snapshotSeq, txId)) {
+                    continue;
+                }
                 Map<String, String>* row = fetchRow(rId);
-                if (!row) continue;
-                if (activeGroups.size() == 0 || evaluateClauses(*row, activeGroups, nullptr, rId) >= 0.0f) {
+                if (!row) {
+                    continue;
+                }
+                f32 score = evaluateClauses(*row, activeGroups, nullptr, rId);
+                if (activeGroups.size() == 0 || score >= 0.0f) {
                     currentRows.push(rId);
                 }
             }
@@ -1352,6 +1526,9 @@ Array<Map<String, String>> TableStore::read(const Array<String>& columns, const 
                 ColSelection sel = parseColSelection(columns[i]);
                 outputKeys.push(sel.name);
             }
+            if (!selMap.has("id")) outputKeys.push("id");
+            if (!selMap.has("name")) outputKeys.push("name");
+            if (!selMap.has("parent_id")) outputKeys.push("parent_id");
         }
 
         for (usz i = 0; i < outputKeys.size(); ++i) {
@@ -2187,8 +2364,47 @@ void TableStore::flushHnsw() {
     }
 }
 
+static String getFullPath(u64 rId, TableStore* store) {
+    u64 currentId = rId;
+    int depth = 0;
+    String path;
+    while (currentId != 0 && depth < 20) {
+        Map<String, String>* row = store->fetchRow(currentId);
+        if (!row) break;
+        String name = row->has("name") ? *row->get("name") : "";
+        if (store->globalKeys) name = CryptItem::decrypt(name, *store->globalKeys);
+        String pId = row->has("parent_id") ? *row->get("parent_id") : "";
+        if (store->globalKeys) pId = CryptItem::decrypt(pId, *store->globalKeys);
+        
+        if (path.isEmpty()) {
+            path = name;
+        } else {
+            path = name + "/" + path;
+        }
+        
+        if (pId.isEmpty()) break;
+        
+        u64 parentRId = 0;
+        if (store->colHashIndexDirty) {
+            store->rebuildColHashIndex();
+        }
+        auto* valMap = store->colHashIndex.get("id");
+        if (valMap && valMap->has(pId)) {
+            const auto& rIds = *valMap->get(pId);
+            if (rIds.size() > 0) {
+                parentRId = rIds[0];
+            }
+        }
+        if (parentRId == 0) break;
+        currentId = parentRId;
+        depth++;
+    }
+    return "/" + path;
+}
+
 Array<u64> TableStore::resolvePathPattern(const String& colName, const String& pathPattern, u64 snapshotSeq, u64 txId) {
     Array<u64> matchingRowIds;
+    Array<u64> finalMatches;
     
     String p = pathPattern;
     if (p.startsWith("\"") && p.endsWith("\"")) p = p.slice(1, p.size() - 1);
@@ -2278,6 +2494,17 @@ Array<u64> TableStore::resolvePathPattern(const String& colName, const String& p
             }
             nextParentVals = descendants;
         } else {
+            bool segHasWildcard = false;
+            for (usz idx = 0; idx < seg.size(); ++idx) {
+                if (seg[idx] == '\\') {
+                    idx++;
+                } else if (seg[idx] == '*' || seg[idx] == '?') {
+                    segHasWildcard = true;
+                    break;
+                }
+            }
+            bool segIsPattern = segHasWildcard || isRegexSyntax(seg);
+            
             for (usz j = 0; j < currentParentVals.size(); ++j) {
                 String pId = currentParentVals[j];
                 if (parentToRowIds.has(pId)) {
@@ -2290,7 +2517,30 @@ Array<u64> TableStore::resolvePathPattern(const String& colName, const String& p
                         String segVal = row->has(colName) ? *row->get(colName) : "";
                         if (globalKeys) segVal = CryptItem::decrypt(segVal, *globalKeys);
                         
-                        if (matchPattern(segVal, seg)) {
+                        bool isMatch = false;
+                        if (segIsPattern) {
+                            isMatch = matchPattern(segVal, seg);
+                        } else {
+                            if (segVal == "**") {
+                                finalMatches.push(rId);
+                                String idVal = row->has("id") ? *row->get("id") : "";
+                                if (globalKeys) idVal = CryptItem::decrypt(idVal, *globalKeys);
+                                if (!idVal.isEmpty()) {
+                                    nextParentVals.push(idVal);
+                                }
+                            } else if (segVal == "*") {
+                                String idVal = row->has("id") ? *row->get("id") : "";
+                                if (globalKeys) idVal = CryptItem::decrypt(idVal, *globalKeys);
+                                if (!idVal.isEmpty()) {
+                                    nextParentVals.push(idVal);
+                                    stepMatchingRowIds.push(rId);
+                                }
+                            } else {
+                                isMatch = matchPattern(segVal, seg) || matchPattern(seg, segVal);
+                            }
+                        }
+                        
+                        if (isMatch) {
                             String idVal = row->has("id") ? *row->get("id") : "";
                             if (globalKeys) idVal = CryptItem::decrypt(idVal, *globalKeys);
                             if (!idVal.isEmpty()) {
@@ -2306,6 +2556,44 @@ Array<u64> TableStore::resolvePathPattern(const String& colName, const String& p
         currentParentVals = nextParentVals;
         if (step == cleanParts.size() - 1) {
             matchingRowIds = stepMatchingRowIds;
+        }
+    }
+    
+    for (usz i = 0; i < finalMatches.size(); ++i) {
+        bool duplicate = false;
+        for (usz j = 0; j < matchingRowIds.size(); ++j) {
+            if (matchingRowIds[j] == finalMatches[i]) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) {
+            matchingRowIds.push(finalMatches[i]);
+        }
+    }
+    
+    // Fallback: check full path of all visible rows directly against pathPattern
+    for (u64 rId : allRowIds) {
+        if (!isVisibleToSnapshot(rId, snapshotSeq, txId)) continue;
+        String fullPath = getFullPath(rId, this);
+        
+        String cleanPattern = p;
+        if (cleanPattern.startsWith("/")) cleanPattern = cleanPattern.substring(1);
+        
+        String cleanRowPath = fullPath;
+        if (cleanRowPath.startsWith("/")) cleanRowPath = cleanRowPath.substring(1);
+        
+        if (matchPathPattern(cleanRowPath, cleanPattern)) {
+            bool duplicate = false;
+            for (usz j = 0; j < matchingRowIds.size(); ++j) {
+                if (matchingRowIds[j] == rId) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate) {
+                matchingRowIds.push(rId);
+            }
         }
     }
     

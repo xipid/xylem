@@ -3,12 +3,16 @@
 #include <Terminal/Command.hpp>
 #include <Terminal/Format.hpp>
 #include <Xylem/Xylem.hpp>
+#include <Xylem/Client.hpp>
+#include <Xylem/Server.hpp>
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <thread>
+#include <mutex>
 
 using namespace Xi;
 using namespace Collection;
@@ -17,6 +21,42 @@ using namespace Xylem;
 
 #include <Terminal/Prompt.hpp>
 #include <Xi/Random.hpp>
+
+std::mutex g_engineMutex;
+
+bool isNumericalAddressStr(const String& str) {
+    if (str.startsWith("7.") || str.startsWith("8.")) return true;
+    
+    // Check IPv6
+    int colons = 0;
+    bool hasBrackets = str.startsWith("[");
+    for (usz i = 0; i < str.size(); i++) {
+        if (str[i] == ':') colons++;
+    }
+    if (colons >= 2 || hasBrackets) return true;
+    
+    // Check IPv4 with optional port
+    String host = str;
+    if (colons == 1) {
+        long long idx = str.indexOf(":");
+        host = str.slice(0, idx);
+    }
+    Array<String> parts = host.split(".");
+    if (parts.size() == 4) {
+        bool allNumeric = true;
+        for (usz i = 0; i < parts.size(); i++) {
+            if (parts[i].isEmpty()) { allNumeric = false; break; }
+            for (usz j = 0; j < parts[i].size(); j++) {
+                if (parts[i][j] < '0' || parts[i][j] > '9') {
+                    allNumeric = false;
+                    break;
+                }
+            }
+        }
+        if (allNumeric) return true;
+    }
+    return false;
+}
 
 String toHexString(const String &data) {
   const char *hexChars = "0123456789abcdef";
@@ -70,7 +110,8 @@ RowNode *getDeepestRowNode(TreeItem *item) {
   return nullptr;
 }
 
-String getPathId(XylemEngine &xm, const String &absolutePath) {
+template <typename T>
+String getPathId(T &xm, const String &absolutePath) {
   if (absolutePath == "/" || absolutePath.isEmpty()) {
     return "";
   }
@@ -99,7 +140,8 @@ String getPathId(XylemEngine &xm, const String &absolutePath) {
   return currentId;
 }
 
-bool getPathRow(XylemEngine &xm, const String &absolutePath,
+template <typename T>
+bool getPathRow(T &xm, const String &absolutePath,
                 Map<String, String> &outRow) {
   if (absolutePath == "/" || absolutePath.isEmpty()) {
     outRow.set("id", "");
@@ -122,7 +164,8 @@ bool getPathRow(XylemEngine &xm, const String &absolutePath,
   return true;
 }
 
-void recursiveRemove(XylemEngine &xm, const String &id) {
+template <typename T>
+void recursiveRemove(T &xm, const String &id) {
   String q = "READ id WHERE parent_id=%1";
   Array<String> args;
   args.push(id);
@@ -251,6 +294,173 @@ void printResult(const QueryResult &res) {
   }
 }
 
+static String quoteTokenIfNeeded(const String& t) {
+  if (t.isEmpty()) {
+    return "\"\"";
+  }
+  bool needsQuotes = false;
+  for (usz i = 0; i < t.size(); ++i) {
+    char c = t[i];
+    if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '#' || c == '"' || c == '\'' || c == '\\') {
+      needsQuotes = true;
+      break;
+    }
+  }
+  if (!needsQuotes) return t;
+  
+  String res = "\"";
+  for (usz i = 0; i < t.size(); ++i) {
+    char c = t[i];
+    if (c == '\\' || c == '"') {
+      res += "\\";
+    }
+    res.push(c);
+  }
+  res += "\"";
+  return res;
+}
+
+static String preprocessClientQuery(const String& line, XylemClient& client, const Security::KeyPair& clientKeys) {
+  Array<String> tokens = QueryParser::tokenize(line, Array<String>());
+  if (tokens.size() == 0) return line;
+
+  String cmd = tokens[0].toUpperCase();
+  if (cmd != "WRITE" && cmd != "WRITEVOLATILE") {
+    return line;
+  }
+
+  struct ScanCol {
+    String col;
+    String val;
+    bool isSign = false;
+  };
+
+  Array<ScanCol> scanCols;
+  bool hasSign = false;
+  usz idx = 1;
+  while (idx < tokens.size()) {
+    String t = tokens[idx];
+    String tu = t.toUpperCase();
+    if (tu == "WHERE" || tu == "ASSERT" || tu == "FOLLOW" || tu == "REPEATFOLLOW" || tu == "LIMIT" || tu == "PAGE") {
+      break;
+    }
+    
+    bool isThreeToken = false;
+    if (idx + 2 < tokens.size()) {
+      String op = tokens[idx+1];
+      if (op == "=") {
+        ScanCol sc;
+        sc.col = tokens[idx];
+        sc.val = tokens[idx+2];
+        if (sc.col == "owning:sign") {
+          sc.isSign = true;
+          hasSign = true;
+        }
+        scanCols.push(sc);
+        idx += 2;
+        isThreeToken = true;
+      }
+    }
+    
+    if (!isThreeToken) {
+      ScanCol sc;
+      long long eqPos = t.indexOf("=");
+      if (eqPos >= 0) {
+        sc.col = t.slice(0, eqPos);
+        sc.val = t.slice(eqPos + 1, t.size());
+      } else {
+        sc.col = t;
+        sc.val = "";
+      }
+      if (sc.col == "owning:sign") {
+        sc.isSign = true;
+        hasSign = true;
+      }
+      scanCols.push(sc);
+    }
+    idx++;
+  }
+
+  if (!hasSign) {
+    return line;
+  }
+
+  // First resolve any :generate columns client-side, because the client needs to sign the actual generated values!
+  for (usz i = 0; i < scanCols.size(); ++i) {
+    if (scanCols[i].col.endsWith(":generate")) {
+      String baseCol = scanCols[i].col.substring(0, scanCols[i].col.size() - 9);
+      scanCols[i].col = baseCol;
+      scanCols[i].val = client.generateId(baseCol);
+    }
+  }
+
+  // Prepare columns for deterministic sorting and serialization
+  Array<Clause> sorted;
+  for (usz i = 0; i < scanCols.size(); ++i) {
+    if (scanCols[i].col == "owning" || scanCols[i].isSign) {
+      continue;
+    }
+    Clause c;
+    c.col = scanCols[i].col;
+    c.val = scanCols[i].val;
+    sorted.push(c);
+  }
+
+  // Sort alphabetically by column name
+  for (usz i = 0; i < sorted.size(); ++i) {
+    for (usz j = i + 1; j < sorted.size(); ++j) {
+      if (sorted[j].col < sorted[i].col) {
+        Clause tmp = sorted[i];
+        sorted[i] = sorted[j];
+        sorted[j] = tmp;
+      }
+    }
+  }
+
+  // Serialize
+  String msg = "";
+  for (usz i = 0; i < sorted.size(); ++i) {
+    if (!msg.isEmpty()) msg += ";";
+    msg += sorted[i].col + "=" + sorted[i].val;
+  }
+
+  // Sign using the client keys
+  String sig = Security::signX(clientKeys.secretKey, msg);
+  String sigHex = "";
+  for (usz i = 0; i < sig.size(); ++i) {
+    char buf[3];
+    sprintf(buf, "%02x", (unsigned char)sig[i]);
+    sigHex += buf;
+  }
+
+  String clientHash = Security::hash(clientKeys.publicKey, 8);
+  String clientHashHex = "";
+  for (usz i = 0; i < clientHash.size(); ++i) {
+    char buf[3];
+    sprintf(buf, "%02x", (unsigned char)clientHash[i]);
+    clientHashHex += buf;
+  }
+
+  String owningVal = clientHashHex + sigHex;
+
+  // Build the new query
+  String newQuery = tokens[0]; // WRITE or WRITEVOLATILE
+  for (usz i = 0; i < scanCols.size(); ++i) {
+    if (scanCols[i].isSign) {
+      newQuery += " owning=" + quoteTokenIfNeeded(owningVal);
+    } else {
+      newQuery += " " + scanCols[i].col + "=" + quoteTokenIfNeeded(scanCols[i].val);
+    }
+  }
+
+  // Append remaining tokens (WHERE, ASSERT, etc.)
+  for (usz i = idx; i < tokens.size(); ++i) {
+    newQuery += " " + quoteTokenIfNeeded(tokens[i]);
+  }
+
+  return newQuery;
+}
+
 int main(int argc, char **argv) {
   Command args(argc, argv);
   args.description("Xylem Database CLI Interface").version("1.0.0");
@@ -266,62 +476,84 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  bool isClient = isNumericalAddressStr(dbPath);
   XylemEngine xm;
-  struct stat st;
-  if (stat((const char *)dbPath.data(), &st) == 0 && st.st_size > 0) {
-    xm.config.deviceSize = st.st_size;
+  XylemClient client;
+  Lines::Bind cliBind("127.0.0.1:0");
+  Security::KeyPair clientKeys;
+
+  if (isClient) {
+    clientKeys = Security::generateKeyPair();
+    if (!client.connect(cliBind, dbPath, clientKeys)) {
+      printf("Error: Failed to connect to remote address %s\n", dbPath.c_str());
+      return 1;
+    }
+    printf("Connected to remote Xylem database at %s.\n", dbPath.c_str());
+    String clientHash = Security::hash(clientKeys.publicKey, 8);
+    String clientHashHex;
+    for (usz i = 0; i < clientHash.size(); ++i) {
+      char buf[3];
+      sprintf(buf, "%02x", (unsigned char)clientHash[i]);
+      clientHashHex += buf;
+    }
+    printf("My Identity Public Key Hash: %s\n", clientHashHex.c_str());
   } else {
-    xm.config.deviceSize = 0; // Starts at minimum, expands
-  }
-  xm.config.deviceExpands = true;
-  xm.config.blockSize = 4096;
-  xm.config.readSize = 4096;
-  xm.config.writeSize = 4096;
-  xm.maxCache =
-      1024 * 1024 *
-      128; // 128MB Cache (prevents table thrashing during bulk operations)
+    struct stat st;
+    if (stat((const char *)dbPath.data(), &st) == 0 && st.st_size > 0) {
+      xm.config.deviceSize = st.st_size;
+    } else {
+      xm.config.deviceSize = 0; // Starts at minimum, expands
+    }
+    xm.config.deviceExpands = true;
+    xm.config.blockSize = 4096;
+    xm.config.readSize = 4096;
+    xm.config.writeSize = 4096;
+    xm.maxCache =
+        1024 * 1024 *
+        128; // 128MB Cache (prevents table thrashing during bulk operations)
 
-  // File I/O for the block device
-  int fd = open((const char *)dbPath.data(), O_RDWR | O_CREAT, 0644);
-  if (fd < 0) {
-    printf("Error: Could not open or create file %s\n", dbPath.data());
-    return 1;
-  }
-  xm.config.onDeviceRead = [fd](u64 offset, u64 maxOffset) -> String {
-    String buf;
-    buf.allocate(maxOffset - offset);
-    buf.fill(0xFF);
-    pread(fd, buf.data(), buf.size(), offset);
-    return buf;
-  };
-  xm.config.onDeviceWrite = [fd](u64 offset, String data) -> bool {
-    bool ok = pwrite(fd, data.data(), data.size(), offset) == (ssize_t)data.size();
-    if (ok) fdatasync(fd);
-    return ok;
-  };
-  xm.config.onDeviceErase = [fd](u64 offset, u64 maxOffset) -> bool {
-    String empty;
-    empty.allocate(maxOffset - offset);
-    empty.fill(0xFF);
-    bool ok = pwrite(fd, empty.data(), empty.size(), offset) == (ssize_t)empty.size();
-    if (ok) fdatasync(fd);
-    return ok;
-  };
-
-  // Auto Mount (format if it fails)
-  if (!xm.mount()) {
-    printf("Database not found or corrupt. Formatting new database at %s...\n",
-           dbPath.data());
-    if (!xm.format()) {
-      printf("Error: Failed to format database!\n");
+    // File I/O for the block device
+    int fd = open((const char *)dbPath.data(), O_RDWR | O_CREAT, 0644);
+    if (fd < 0) {
+      printf("Error: Could not open or create file %s\n", dbPath.data());
       return 1;
     }
+    xm.config.onDeviceRead = [fd](u64 offset, u64 maxOffset) -> String {
+      String buf;
+      buf.allocate(maxOffset - offset);
+      buf.fill(0xFF);
+      pread(fd, buf.data(), buf.size(), offset);
+      return buf;
+    };
+    xm.config.onDeviceWrite = [fd](u64 offset, String data) -> bool {
+      bool ok = pwrite(fd, data.data(), data.size(), offset) == (ssize_t)data.size();
+      if (ok) fdatasync(fd);
+      return ok;
+    };
+    xm.config.onDeviceErase = [fd](u64 offset, u64 maxOffset) -> bool {
+      String empty;
+      empty.allocate(maxOffset - offset);
+      empty.fill(0xFF);
+      bool ok = pwrite(fd, empty.data(), empty.size(), offset) == (ssize_t)empty.size();
+      if (ok) fdatasync(fd);
+      return ok;
+    };
+
+    // Auto Mount (format if it fails)
     if (!xm.mount()) {
-      printf("Error: Failed to mount database after formatting!\n");
-      return 1;
+      printf("Database not found or corrupt. Formatting new database at %s...\n",
+             dbPath.data());
+      if (!xm.format()) {
+        printf("Error: Failed to format database!\n");
+        return 1;
+      }
+      if (!xm.mount()) {
+        printf("Error: Failed to mount database after formatting!\n");
+        return 1;
+      }
     }
+    printf("Successfully mounted Xylem database at %s.\n", dbPath.data());
   }
-  printf("Successfully mounted Xylem database at %s.\n", dbPath.data());
 
   // Interactive Loop
   bool isInteractive = isatty(fileno(stdin));
@@ -336,6 +568,8 @@ int main(int argc, char **argv) {
 
     if (line.isEmpty())
       continue;
+
+    std::unique_lock<std::mutex> lock(g_engineMutex);
 
     String uLine = line.toUpperCase();
     if (uLine == "EXIT" || uLine == "QUIT")
@@ -357,7 +591,9 @@ int main(int argc, char **argv) {
           pwd = "/";
         } else {
           Map<String, String> row;
-          if (getPathRow(xm, targetPath, row)) {
+          bool rowExists = isClient ? getPathRow(client, targetPath, row)
+                                    : getPathRow(xm, targetPath, row);
+          if (rowExists) {
             if (row.has("type") && *row.get("type") == "dir") {
               pwd = targetPath;
             } else {
@@ -378,7 +614,7 @@ int main(int argc, char **argv) {
               Array<String> a;
               a.push(partName);
               a.push(currentParentId);
-              QueryResult r = xm.query(q, a);
+              QueryResult r = isClient ? client.query(q, a) : xm.query(q, a);
 
               if (r.readRows.size() > 0 && r.readRows[0].has("id")) {
                 currentParentId = *r.readRows[0].get("id");
@@ -391,7 +627,11 @@ int main(int argc, char **argv) {
                 wa.push(partName);
                 wa.push(currentParentId);
                 wa.push(newId);
-                xm.query(wq, wa);
+                if (isClient) {
+                  client.query(wq, wa);
+                } else {
+                  xm.query(wq, wa);
+                }
                 currentParentId = newId;
               }
             }
@@ -413,7 +653,8 @@ int main(int argc, char **argv) {
         continue;
       }
       String targetPath = resolvePath(pwd, tokens[1]);
-      QueryResult res = xm.query("CAT \"" + targetPath + "\"");
+      QueryResult res = isClient ? client.query("CAT \"" + targetPath + "\"")
+                                 : xm.query("CAT \"" + targetPath + "\"");
       bool printed = false;
       if (res.readRows.size() > 0 && res.readRows[0].has("content")) {
         printf("%s\n", res.readRows[0].get("content")->c_str());
@@ -460,7 +701,20 @@ int main(int argc, char **argv) {
       dirCache.set("/", "");
       Array<String> newDirs;
 
-      u64 txId = xm.lock(Array<Clauses>(), 0, false);
+      auto doQuery = [&](const String &q, const Array<String> &a = Array<String>()) {
+        return isClient ? client.query(q, a) : xm.query(q, a);
+      };
+      auto doWrite = [&](const Array<Clause> &cols, const Array<Clauses> &cls = Array<Clauses>(), u64 tx = 0) {
+        return isClient ? client.write(cols, cls, tx) : xm.write(cols, cls, tx);
+      };
+      auto doLock = [&](u64 tx) {
+        return isClient ? client.lock(Array<Clauses>(), tx, false) : xm.lock(Array<Clauses>(), tx, false);
+      };
+      auto doUnlock = [&](u64 tx) {
+        return isClient ? client.unlock(tx) : xm.unlock(tx);
+      };
+
+      u64 txId = doLock(0);
       int txCount = 0;
 
       auto uploadFile = [&](const String &srcPath, const String &dstPath) {
@@ -499,7 +753,7 @@ int main(int argc, char **argv) {
               Array<String> a;
               a.push(partName);
               a.push(currentParentId);
-              QueryResult r = xm.query(q, a);
+              QueryResult r = doQuery(q, a);
 
               if (r.readRows.size() > 0 && r.readRows[0].has("id")) {
                 currentParentId = *r.readRows[0].get("id");
@@ -532,7 +786,7 @@ int main(int argc, char **argv) {
                 writeCols.push(c3);
                 writeCols.push(c4);
                 writeCols.push(c5);
-                xm.write(writeCols, Array<Clauses>(), txId);
+                doWrite(writeCols, Array<Clauses>(), txId);
                 currentParentId = newId;
                 newDirs.push(currentPathStr);
               }
@@ -545,7 +799,7 @@ int main(int argc, char **argv) {
           Array<String> fa;
           fa.push(fileName);
           fa.push(currentParentId);
-          QueryResult rFile = xm.query(fileIdQuery, fa);
+          QueryResult rFile = doQuery(fileIdQuery, fa);
 
           bool fileFound = false;
           String fileId;
@@ -573,7 +827,7 @@ int main(int argc, char **argv) {
             group.push(cId);
             queryClauses.push(group);
 
-            xm.write(writeCols, queryClauses, txId);
+            doWrite(writeCols, queryClauses, txId);
           } else {
             u64 rnd = ((u64)Xi::randomNext() << 32) | Xi::randomNext();
             fileId = String(rnd);
@@ -610,13 +864,13 @@ int main(int argc, char **argv) {
             c6.val = "644";
             writeCols.push(c6);
 
-            xm.write(writeCols, Array<Clauses>(), txId);
+            doWrite(writeCols, Array<Clauses>(), txId);
           }
 
           txCount++;
           if (txCount >= 50) {
-            xm.unlock(txId);
-            txId = xm.lock(Array<Clauses>(), 0, false);
+            doUnlock(txId);
+            txId = doLock(0);
             txCount = 0;
           }
 
@@ -651,8 +905,9 @@ int main(int argc, char **argv) {
       }
 
       if (txCount > 0)
-        xm.unlock(txId);
-      xm.flush();
+        doUnlock(txId);
+      if (!isClient)
+        xm.flush();
 
       progress.destroy();
       Terminal::Success("Import complete: " + String::from((long long)totalFiles) + " files (" + String::from((long long)totalBytes) + " bytes) successfully imported.");
@@ -668,7 +923,7 @@ int main(int argc, char **argv) {
       String linuxPath = tokens[2];
 
       String q = "READ WHERE name path \"" + xylemPath + "/**\"";
-      QueryResult res = xm.query(q);
+      QueryResult res = isClient ? client.query(q) : xm.query(q);
       if (res.code >= 0 && res.readRows.size() > 0) {
         // Reconstruct tree and process
         // 1. Put all rows in a map by ID
@@ -770,7 +1025,7 @@ int main(int argc, char **argv) {
         String targetPath = resolvePath(pwd, tokens[1]);
         line = cmd + " \"" + targetPath + "\"";
         for (usz i = 2; i < tokens.size(); ++i) {
-          line += " " + tokens[i];
+          line += " " + quoteTokenIfNeeded(tokens[i]);
         }
       } else if (cmd == "LS") {
         line = "LS \"" + pwd + "\"";
@@ -778,9 +1033,9 @@ int main(int argc, char **argv) {
     } else if (cmd == "TEE") {
       if (tokens.size() > 2) {
         String targetPath = resolvePath(pwd, tokens[1]);
-        line = "TEE \"" + targetPath + "\" " + tokens[2];
+        line = "TEE \"" + targetPath + "\" " + quoteTokenIfNeeded(tokens[2]);
         for (usz i = 3; i < tokens.size(); ++i) {
-          line += " " + tokens[i];
+          line += " " + quoteTokenIfNeeded(tokens[i]);
         }
       }
     } else if (cmd == "CP" || cmd == "MV") {
@@ -789,7 +1044,7 @@ int main(int argc, char **argv) {
         String dstPath = resolvePath(pwd, tokens[2]);
         line = cmd + " \"" + srcPath + "\" \"" + dstPath + "\"";
         for (usz i = 3; i < tokens.size(); ++i) {
-          line += " " + tokens[i];
+          line += " " + quoteTokenIfNeeded(tokens[i]);
         }
       } else {
         printf("Error: %s requires <src> <dst>\n", cmd.c_str());
@@ -797,15 +1052,53 @@ int main(int argc, char **argv) {
       }
     }
 
+    if (cmd == "SERVE") {
+      if (isClient) {
+        printf("Error: Cannot serve in client mode.\n");
+        continue;
+      }
+      if (tokens.size() < 2) {
+        printf("Error: SERVE requires <numerical_address>\n");
+        continue;
+      }
+      static bool isServing = false;
+      if (isServing) {
+        printf("Error: Server is already running.\n");
+        continue;
+      }
+      String addrStr = tokens[1];
+      isServing = true;
+      printf("Serving database at %s in background.\n", addrStr.c_str());
+      std::thread srvThread([addrStr, &xm]() {
+        Lines::Bind srvBind(addrStr);
+        XylemServer server(xm, &g_engineMutex);
+        server.hook(srvBind);
+        while (true) {
+          srvBind.update();
+          server.update();
+          usleep(1000);
+        }
+      });
+      srvThread.detach();
+      continue;
+    }
+
     // Pass any other command directly to the Query Parser
-    QueryResult res = xm.query(line);
+    String queryStr = line;
+    if (isClient) {
+      queryStr = preprocessClientQuery(line, client, clientKeys);
+      if (queryStr != line) {
+        printf("xy: [Signed Query] %s\n", queryStr.c_str());
+      }
+    }
+    QueryResult res = isClient ? client.query(queryStr) : xm.query(line);
     printResult(res);
     if (cmd == "WRITE" || cmd == "WRITEVOLATILE" || cmd == "RM" ||
         cmd == "TEE") {
       // xm.flush() is now done internally instantly by XylemEngine.
     }
 
-    if (cmd == "VACUUM" || cmd == "VACCUM" || cmd == "DESTROY") {
+    if (!isClient && (cmd == "VACUUM" || cmd == "VACCUM" || cmd == "DESTROY")) {
       u64 unused = xm.getUnusedBlockSpace();
       u64 newSize = xm.config.deviceSize - unused;
       if (newSize > 0) {
@@ -816,14 +1109,16 @@ int main(int argc, char **argv) {
     }
   }
 
-  xm.vaccum();
-  u64 unused = xm.getUnusedBlockSpace();
-  u64 newSize = xm.config.deviceSize - unused;
-  xm.vaccum();
-  if (newSize > 0 && newSize < xm.config.deviceSize) {
-    truncate((const char *)dbPath.data(), newSize);
-    printf("Vacuumed on exit. File size reduced to %llu bytes.\n",
-           (unsigned long long)newSize);
+  if (!isClient) {
+    xm.vaccum();
+    u64 unused = xm.getUnusedBlockSpace();
+    u64 newSize = xm.config.deviceSize - unused;
+    xm.vaccum();
+    if (newSize > 0 && newSize < xm.config.deviceSize) {
+      truncate((const char *)dbPath.data(), newSize);
+      printf("Vacuumed on exit. File size reduced to %llu bytes.\n",
+             (unsigned long long)newSize);
+    }
   }
 
   printf("Goodbye.\n");

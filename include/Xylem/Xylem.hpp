@@ -108,6 +108,7 @@ public:
 
 private:
     friend class QueryParser;
+    friend class XylemServer;
 
     u8 pinnedRawBits[1024];
     u32 currentSuperblockIdx = 0xFFFFFFFFu;

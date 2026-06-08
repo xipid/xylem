@@ -47,6 +47,26 @@ else()
     message(FATAL_ERROR "xic not found at ${XIC_DIR}")
 endif()
 
+# Include the local 'rho' library from the sibling directory
+get_filename_component(RHO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../rho" ABSOLUTE)
+if(NOT EXISTS "${RHO_DIR}/CMakeLists.txt")
+    message(STATUS "rho not found at ${RHO_DIR}, downloading automatically...")
+    execute_process(
+        COMMAND git clone https://github.com/xipid/rho.git "${RHO_DIR}"
+        RESULT_VARIABLE CLONE_RESULT
+    )
+    if(NOT CLONE_RESULT EQUAL 0)
+        message(FATAL_ERROR "Failed to automatically download rho from https://github.com/xipid/rho.git")
+    endif()
+endif()
+
+if(EXISTS "${RHO_DIR}/CMakeLists.txt")
+    message(STATUS "Found rho at ${RHO_DIR}")
+    add_subdirectory(${RHO_DIR} ${CMAKE_CURRENT_BINARY_DIR}/rho)
+else()
+    message(FATAL_ERROR "rho not found at ${RHO_DIR}")
+endif()
+
 # --- Automatic Source Discovery ---
 file(GLOB_RECURSE XYLEM_SOURCES 
     "src/Xylem/*.cpp"
@@ -61,8 +81,8 @@ target_include_directories(Xylem PUBLIC
     $<INSTALL_INTERFACE:include>
 )
 
-# Link against Xi
-target_link_libraries(Xylem PUBLIC Xi::Xi)
+# Link against Xi and Rho
+target_link_libraries(Xylem PUBLIC Xi::Xi Rho)
 
 # --- Test Discovery ---
 file(GLOB TEST_SOURCES "tests/*.cpp")

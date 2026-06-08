@@ -88,8 +88,10 @@ static Clause parseClauseStr(const String& str) {
     c.op = "=";
     // Look for operators
     Array<String> ops;
-    ops.push("=="); ops.push("<="); ops.push(">="); ops.push("reg");
-    ops.push("cos"); ops.push("hash"); ops.push("path"); ops.push("empty"); ops.push("="); ops.push("<"); ops.push(">");
+    ops.push("=="); ops.push("<="); ops.push(">="); ops.push("reg"); ops.push("!=");
+    ops.push("cos"); ops.push("hash"); ops.push("path"); ops.push("empty");
+    ops.push("!has"); ops.push("has");
+    ops.push("="); ops.push("<"); ops.push(">");
     for (const String& op : ops) {
         long long pos = str.indexOf(op);
         if (pos >= 0) {
@@ -239,6 +241,7 @@ static void parseClausesFromTokens(const Array<String>& tokens, usz& idx, Array<
                     String op = tokens[idx+1];
                     if (op == "==" || op == "<=" || op == ">=" || op == "reg" ||
                         op == "cos" || op == "hash" || op == "path" ||
+                        op == "!has" || op == "has" ||
                         op == "=" || op == "<" || op == ">") {
                         Clause c;
                         c.col = tokens[idx];
