@@ -165,6 +165,7 @@ public:
 
   // Removes the blob and frees its blocks
   bool removeHash(const String &hash);
+  bool shredBlob(const String &hash);
 
   // On mount: scan BAM for BLOB blocks and rebuild index from first-block
   // headers

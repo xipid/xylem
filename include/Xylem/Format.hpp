@@ -94,6 +94,35 @@ inline String extractBlobHash(const String& val) {
     return val.slice(BLOB_MARKER_LEN);
 }
 
+// ─── Lock reference marker ──────────────────────────────────────────────────
+// Stored in column values to indicate a lock/commit reference:
+//   [0x00, 'L', 'C', 'K'] + 8-byte LE u64 lock/commit ID = 12 bytes total
+static constexpr u8  LOCK_MARKER[] = {0x00, 'L', 'C', 'K'};
+static constexpr u32 LOCK_MARKER_LEN = 4;
+static constexpr u32 LOCK_REF_SIZE = LOCK_MARKER_LEN + 8; // 12
+
+inline String makeLockRef(u64 lockId) {
+    String ref;
+    ref.allocate(LOCK_REF_SIZE);
+    for (u32 i = 0; i < LOCK_MARKER_LEN; ++i) ref[i] = LOCK_MARKER[i];
+    *(u64*)(ref.data() + LOCK_MARKER_LEN) = lockId;
+    return ref;
+}
+
+inline bool isLockRef(const String& val) {
+    if ((u32)val.size() != LOCK_REF_SIZE) return false;
+    for (u32 i = 0; i < LOCK_MARKER_LEN; ++i) {
+        if ((u8)val[i] != LOCK_MARKER[i]) return false;
+    }
+    return true;
+}
+
+inline u64 extractLockId(const String& val) {
+    if (!isLockRef(val)) return 0;
+    return *(const u64*)(val.data() + LOCK_MARKER_LEN);
+}
+
+
 // Simple unoptimized CRC32 for metadata blocks
 inline u32 crc32(const u8* data, usz len) {
     u32 crc = 0xFFFFFFFF;

@@ -1,5 +1,6 @@
 #include <Xylem/Xylem.hpp>
 #include <Xylem/XBDiff.hpp>
+#include <Xylem/CryptItem.hpp>
 #include <Xi/Random.hpp>
 #include <Security/Crypto.hpp>
 #include <stdint.h>
@@ -242,12 +243,27 @@ bool XylemEngine::mount() {
     journal->initFromFormat((u16)jnlStart, (u16)jnlCount, maxSeq);
 
     tableStore = new TableStore(device, allocator, &globalKeys);
+    tableStore->engine = this;
     tableStore->maxMemoryBytes = maxCache > 0 ? maxCache / 2 : 4 * 1024 * 1024;
 
     blobStore = new BlobStore(device, allocator, &globalKeys);
     blobStore->scanFromDevice();
     blobStore->loadRefsAndUsage();
     blobStore->loadPendingFreezes();
+
+    // Clear any volatile swap blocks from previous run
+    {
+        Array<String> volKeys;
+        for (auto it = blobStore->index.begin(); it != blobStore->index.end(); ++it) {
+            if (it->key.startsWith("VOLATILE_BLOCK_")) {
+                volKeys.push(it->key);
+            }
+        }
+        for (usz i = 0; i < volKeys.size(); ++i) {
+            blobStore->removeHash(volKeys[i]);
+        }
+    }
+
     // Wire up BlobStore pointer in TableStore
     tableStore->blobStore = blobStore;
     blobStore->thawCallback = [this](u64 start, u64 end) {
@@ -375,6 +391,36 @@ bool XylemEngine::mount() {
 
     tableStore->loadSchemas();
     journal->recover(tableStore);
+
+    // Filter active locks by references in rowHistory
+    if (tableStore && journal) {
+        Map<u64, bool> referencedLocks;
+        for (auto it = tableStore->rowHistory.begin(); it != tableStore->rowHistory.end(); ++it) {
+            for (usz i = 0; i < it->value.size(); ++i) {
+                const auto& rv = it->value[i];
+                if (rv.isTombstone) continue;
+                for (auto rit = rv.row.begin(); rit != rv.row.end(); ++rit) {
+                    String val = rit->value;
+                    if (tableStore->globalKeys) {
+                        val = CryptItem::decrypt(val, *tableStore->globalKeys);
+                    }
+                    if (isLockRef(val)) {
+                        referencedLocks.set(extractLockId(val), true);
+                    }
+                }
+            }
+        }
+        
+        Array<u64> toRemove;
+        for (auto it = journal->activeLocks.begin(); it != journal->activeLocks.end(); ++it) {
+            if (!referencedLocks.has(it->key)) {
+                toRemove.push(it->key);
+            }
+        }
+        for (usz i = 0; i < toRemove.size(); ++i) {
+            journal->activeLocks.remove(toRemove[i]);
+        }
+    }
 
     // Purge Volatile SWAP blocks on boot
     Array<String> volatileBlobsToPurge;
@@ -748,8 +794,63 @@ String XylemEngine::generateId(const String& column) {
     }
 }
 
+static bool clausesMatchFilter(const Array<Clauses>& query, const Array<Clauses>& filter) {
+    if (filter.size() == 0) return true; // Wildcard
+    for (usz i = 0; i < filter.size(); ++i) {
+        const auto& filterGroup = filter[i];
+        bool groupMatched = true;
+        for (usz j = 0; j < filterGroup.size(); ++j) {
+            const auto& fc = filterGroup[j];
+            bool foundMatch = false;
+            for (usz k = 0; k < query.size(); ++k) {
+                const auto& qg = query[k];
+                for (usz l = 0; l < qg.size(); ++l) {
+                    const auto& qc = qg[l];
+                    if (qc.col == fc.col && qc.op == fc.op) {
+                        if (fc.val.isEmpty() || qc.val == fc.val) {
+                            foundMatch = true;
+                            break;
+                        }
+                    }
+                }
+                if (foundMatch) break;
+            }
+            if (!foundMatch) {
+                groupMatched = false;
+                break;
+            }
+        }
+        if (groupMatched) return true;
+    }
+    return false;
+}
+
 QueryResult XylemEngine::query(const String& queryString, const Array<String>& sanitized) {
     ensureMounted();
+
+    // Intercept with onQuery if registered
+    String firstWord;
+    {
+        usz start = 0;
+        while (start < queryString.size() && (queryString[start] == ' ' || queryString[start] == '\t' || queryString[start] == '\r' || queryString[start] == '\n')) {
+            start++;
+        }
+        usz end = start;
+        while (end < queryString.size() && queryString[end] != ' ' && queryString[end] != '\t' && queryString[end] != '\r' && queryString[end] != '\n' && queryString[end] != '(' && queryString[end] != ';' && queryString[end] != ',') {
+            end++;
+        }
+        if (end > start) {
+            firstWord = queryString.slice(start, end).toUpperCase();
+        }
+    }
+    if (!firstWord.isEmpty()) {
+        for (usz i = 0; i < queryCallbacks.size(); ++i) {
+            if (queryCallbacks[i].op == firstWord) {
+                return queryCallbacks[i].callback(queryString, this);
+            }
+        }
+    }
+
     return QueryParser::execute(this, queryString, sanitized);
 }
 
@@ -764,14 +865,112 @@ Array<Map<String,String>> XylemEngine::read(const Array<String>& columns, const 
         auto* ls = journal->activeLocks.get(txId);
         if (ls) snapshotSeq = ls->snapshotSeq;
     }
-    return tableStore->read(columns, clauses, length, page, tombstones, snapshotSeq, txId, readAllColumns);
+
+    // Call overlay reads
+    Array<Map<String, String>> overlayResults;
+    for (usz i = 0; i < overlayReads.size(); ++i) {
+        const auto& reg = overlayReads[i];
+        if (clausesMatchFilter(clauses, reg.clauses)) {
+            Array<Clauses> queryClauses;
+            Array<Clauses> assertClauses;
+            for (usz j = 0; j < clauses.size(); ++j) {
+                if (clauses[j].isAssert) {
+                    assertClauses.push(clauses[j]);
+                } else {
+                    queryClauses.push(clauses[j]);
+                }
+            }
+            auto res = reg.callback(queryClauses, assertClauses);
+            for (usz j = 0; j < res.size(); ++j) {
+                overlayResults.push(res[j]);
+            }
+        }
+    }
+
+    auto dbResults = tableStore->read(columns, clauses, length, page, tombstones, snapshotSeq, txId, readAllColumns);
+
+    if (overlayResults.size() == 0) {
+        return dbResults;
+    }
+
+    // Merge and deduplicate by "id"
+    Map<String, usz> idToIndex;
+    Array<Map<String, String>> merged;
+
+    if (length > 0 || page > 0) {
+        auto fullDbResults = tableStore->read(columns, clauses, 0, 0, tombstones, snapshotSeq, txId, readAllColumns);
+        for (usz i = 0; i < fullDbResults.size(); ++i) {
+            String idVal = fullDbResults[i].has("id") ? *fullDbResults[i].get("id") : "";
+            if (!idVal.isEmpty()) {
+                idToIndex.set(idVal, merged.size());
+            }
+            merged.push(fullDbResults[i]);
+        }
+    } else {
+        for (usz i = 0; i < dbResults.size(); ++i) {
+            String idVal = dbResults[i].has("id") ? *dbResults[i].get("id") : "";
+            if (!idVal.isEmpty()) {
+                idToIndex.set(idVal, merged.size());
+            }
+            merged.push(dbResults[i]);
+        }
+    }
+
+    for (usz i = 0; i < overlayResults.size(); ++i) {
+        String idVal = overlayResults[i].has("id") ? *overlayResults[i].get("id") : "";
+        if (!idVal.isEmpty() && idToIndex.has(idVal)) {
+            usz idx = *idToIndex.get(idVal);
+            for (auto it = overlayResults[i].begin(); it != overlayResults[i].end(); ++it) {
+                merged[idx].set(it->key, it->value);
+            }
+        } else {
+            if (!idVal.isEmpty()) {
+                idToIndex.set(idVal, merged.size());
+            }
+            merged.push(overlayResults[i]);
+        }
+    }
+
+    // Post-filter merged results by asserts
+    Array<Clauses> assertClauses;
+    for (usz j = 0; j < clauses.size(); ++j) {
+        if (clauses[j].isAssert) {
+            assertClauses.push(clauses[j]);
+        }
+    }
+
+    if (assertClauses.size() > 0) {
+        Array<Map<String, String>> filtered;
+        for (usz i = 0; i < merged.size(); ++i) {
+            if (tableStore->evaluateClauses(merged[i], assertClauses) >= 0.0f) {
+                filtered.push(merged[i]);
+            }
+        }
+        merged = filtered;
+    }
+
+    // Apply paging
+    if (length > 0 || page > 0) {
+        u64 skip = page * length;
+        Array<Map<String, String>> sliced;
+        u64 endIdx = (length == 0) ? merged.size() : skip + length;
+        if (endIdx > merged.size()) endIdx = merged.size();
+        for (u64 i = skip; i < endIdx; ++i) {
+            sliced.push(merged[i]);
+        }
+        return sliced;
+    }
+
+    return merged;
 }
 
 bool XylemEngine::isWriteBlocked(u64 txId) {
     if (!journal) return false;
     for (auto it = journal->activeLocks.begin(); it != journal->activeLocks.end(); ++it) {
         if (it->value.requiresExplicitAs && it->key != txId) {
-            return true;
+            if (it->value.lockClauses.size() == 0) {
+                return true;
+            }
         }
     }
     return false;
@@ -780,6 +979,19 @@ bool XylemEngine::isWriteBlocked(u64 txId) {
 int XylemEngine::write(const Array<Clause>& columns, const Array<Clauses>& clauses, u64 txId, const String& encryptionKey) {
     ensureMounted();
     if (isWriteBlocked(txId)) return -1;
+
+    // Overlay writes
+    bool skipXylem = false;
+    for (usz i = 0; i < overlayWrites.size(); ++i) {
+        const auto& reg = overlayWrites[i];
+        if (clausesMatchFilter(clauses, reg.clauses)) {
+            if (reg.callback(columns, clauses)) {
+                skipXylem = true;
+            }
+        }
+    }
+    if (skipXylem) return 0;
+
     if (txId != 0) {
         if (!journal) return -1;
         auto* ls = journal->activeLocks.get(txId);
@@ -826,6 +1038,19 @@ int XylemEngine::write(const Array<Clause>& columns, const Array<Clauses>& claus
 int XylemEngine::writeVolatile(const Array<Clause>& columns, const Array<Clauses>& clauses, u64 txId, const String& encryptionKey) {
     ensureMounted();
     if (isWriteBlocked(txId)) return -1;
+
+    // Overlay writes
+    bool skipXylem = false;
+    for (usz i = 0; i < overlayWrites.size(); ++i) {
+        const auto& reg = overlayWrites[i];
+        if (clausesMatchFilter(clauses, reg.clauses)) {
+            if (reg.callback(columns, clauses)) {
+                skipXylem = true;
+            }
+        }
+    }
+    if (skipXylem) return 0;
+
     if (!tableStore) return -1;
     // Bypass journal entirely and flag as volatile
     int result = tableStore->write(columns, clauses, encryptionKey, 0, true);
@@ -842,10 +1067,10 @@ int XylemEngine::writeVolatile(const Array<Clause>& columns, const Array<Clauses
 }
 
 
-bool XylemEngine::rm(const Array<Clauses>& clauses, u64 length, u64 as) {
+bool XylemEngine::rm(const Array<Clauses>& clauses, u64 length, u64 as, bool burn) {
     ensureMounted();
     if (isWriteBlocked(as)) return false;
-    bool ok = tableStore->rm(clauses, length);
+    bool ok = tableStore->rm(clauses, length, burn);
     if (ok) {
         String payload = Journal::serializeTableRemove(clauses, length);
         if (as != 0) {
@@ -863,7 +1088,7 @@ bool XylemEngine::rm(const Array<Clauses>& clauses, u64 length, u64 as) {
 u64 XylemEngine::lock(const Array<Clauses>& clauses, u64 /*id*/, bool requiresExplicitAs) {
     ensureMounted();
     if (!journal) return 0;
-    u64 txId = journal->lockBegin(requiresExplicitAs);
+    u64 txId = journal->lockBegin(clauses, requiresExplicitAs);
     if (tableStore) {
         auto* ls = journal->activeLocks.get(txId);
         if (ls) ls->snapshotSeq = tableStore->currentSeq;

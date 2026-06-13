@@ -144,11 +144,12 @@ void Journal::appendBatch(const Array<JournalEntry>& entries) {
     writeToFlash(entries);
 }
 
-u64 Journal::lockBegin(bool requiresExplicitAs) {
+u64 Journal::lockBegin(const Array<Clauses>& clauses, bool requiresExplicitAs) {
     u64 id = nextLockId++;
     LockState ls;
     ls.snapshotSeq = currentSequence; // MVCC: capture snapshot at lock time
     ls.requiresExplicitAs = requiresExplicitAs;
+    ls.lockClauses = clauses;
     activeLocks.set(id, ls);
 
     String payload; payload.allocate(8);

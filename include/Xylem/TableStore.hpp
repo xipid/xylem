@@ -13,6 +13,13 @@
 namespace Xylem {
 
 class BlobStore; // Forward declaration
+class XylemEngine; // Forward declaration
+
+struct RowVersion {
+    u64 seq;
+    bool isTombstone = false;
+    Map<String, String> row;
+};
 
 struct ColumnSchema {
     String name;
@@ -69,6 +76,7 @@ public:
     BlockDevice* device;
     Allocator* allocator;
     BlobStore* blobStore = nullptr; // Set by XylemEngine::mount()
+    XylemEngine* engine = nullptr;   // Back-pointer for lock queries
 
     Array<TableSchema> schemas;
     
@@ -80,6 +88,7 @@ public:
     Map<u64, Map<String, String>> allRows;
     Array<u64> allRowIds;
     Map<u64, bool> allRowIdsMap;
+    Map<u64, Array<RowVersion>> rowHistory;
     
     struct LruNode {
         u64 id;
@@ -132,7 +141,7 @@ public:
     
     int write(const Array<Clause>& columns, const Array<Clauses>& clauses = Array<Clauses>(),
               const String& encryptionKey = "", u64 txId = 0, bool isVolatile = false);
-    bool rm(const Array<Clauses>& clauses, u64 length = 0);
+    bool rm(const Array<Clauses>& clauses, u64 length = 0, bool burn = false);
 
     Array<u64> getMatchingRowIds(const Array<Clauses>& clauses, u64 snapshotSeq, u64 txId);
     
@@ -146,6 +155,9 @@ public:
     void updateLru(u64 id);
     void evictIfNeeded();
     Map<String, String>* fetchRow(u64 id);
+    Map<String, String>* fetchRowForSnapshot(u64 rId, u64 snapshotSeq);
+    bool hasLockConflict(const Map<String, String>& row, u64 txId);
+    bool hasLockConflictForQuery(const Array<Clauses>& queryClauses, u64 txId);
 
     // Persist all in-memory rows to BlobStore (call on flush/unmount)
     void flushAllRows();
@@ -173,11 +185,11 @@ public:
     bool isBlobReferenced(const String& hash, u64 excludeRowId = 0xFFFFFFFFFFFFFFFFULL);
 
     // Collect blob hashes from a row's values and clean up unreferenced ones
-    void cleanupBlobRefs(const Map<String, String>& row, u64 excludeRowId = 0xFFFFFFFFFFFFFFFFULL);
+    void cleanupBlobRefs(const Map<String, String>& row, u64 excludeRowId = 0xFFFFFFFFFFFFFFFFULL, bool burn = false);
 
     Map<String, u32> blobRefCounts;
     void incrementBlobRef(const String& hash);
-    void decrementBlobRef(const String& hash);
+    void decrementBlobRef(const String& hash, bool burn = false);
 
     // Apply a partial blob operation (range write)
     String applyBlobRange(const String& existingContent, const String& newData, const BlobRange& range);

@@ -39,9 +39,15 @@ WRITEVOLATILE session=abcdef temp_cache=data
 ```
 
 ### `REMOVE`
-Remove rows matching a condition.
+Remove rows matching a condition. Creates a soft-delete (tombstone) visible to snapshots.
 ```sql
 REMOVE WHERE age<18
+```
+
+### `BURN`
+Permanently and forcibly wipes matching rows and shreds their associated content-addressed blobs.
+```sql
+BURN WHERE classification=secret
 ```
 
 ---
@@ -87,10 +93,13 @@ GRAPHWRITE MATCH name=root REPEATFOLLOW parent_id=parent.id SET perms=777
 
 ## 4. MVCC Transactions & Locking
 
-You can create seamless MVCC snapshots or pessimistic locks.
-*   `LOCK [AS TRUE]`: Creates a snapshot transaction. If `AS TRUE` is passed, the lock ID must be passed to subsequent commands to permit writes.
-*   `UNLOCK <txId>`: Releases the lock.
-*   `ROLLBACK <txId>`: Rolls back the transaction associated with the lock.
+You can create isolated MVCC snapshot transactions and clause-based predicate locks.
+*   `LOCK [AS TRUE] [WHERE <clauses>]`: Begins a transaction and acquires a lock.
+    - If `AS TRUE` is specified, it acts as a pessimistic/blocking lock: any concurrent modifications to the matching items (or the whole database if no clauses are specified) outside this transaction are blocked.
+    - If `WHERE <clauses>` is specified, the lock matches and protects only rows satisfying the predicate filter (both current rows and future inserts).
+    - Returns a transaction/lock ID.
+*   `UNLOCK <txId>`: Commits and unlocks the transaction.
+*   `ROLLBACK <txId>`: Discards and rolls back the transaction.
 
 ---
 

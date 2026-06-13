@@ -1,4 +1,6 @@
 #include <Xylem/TableStore.hpp>
+#include <Xylem/Journal.hpp>
+#include <Xylem/Xylem.hpp>
 #include <Xylem/BlobStore.hpp>
 #include <Xylem/CryptItem.hpp>
 #include <Security/Crypto.hpp>
@@ -579,6 +581,67 @@ Map<String, String>* TableStore::fetchRow(u64 id) {
     return nullptr;
 }
 
+Map<String, String>* TableStore::fetchRowForSnapshot(u64 rId, u64 snapshotSeq) {
+    if (snapshotSeq == 0) {
+        auto* history = rowHistory.get(rId);
+        if (history && history->size() > 0) {
+            const auto& latest = (*history)[history->size() - 1];
+            if (latest.isTombstone) return nullptr;
+            return const_cast<Map<String, String>*>(&latest.row);
+        }
+        return fetchRow(rId);
+    }
+    
+    auto* history = rowHistory.get(rId);
+    if (!history) {
+        auto* legacy = fetchRow(rId);
+        if (legacy) {
+            auto* modSeq = rowModSeq.get(rId);
+            u64 createdSeq = modSeq ? *modSeq : 0;
+            if (createdSeq <= snapshotSeq) return legacy;
+        }
+        return nullptr;
+    }
+    
+    const RowVersion* best = nullptr;
+    for (usz i = 0; i < history->size(); ++i) {
+        if ((*history)[i].seq <= snapshotSeq) {
+            best = &(*history)[i];
+        } else {
+            break;
+        }
+    }
+    
+    if (best && !best->isTombstone) {
+        return const_cast<Map<String, String>*>(&best->row);
+    }
+    return nullptr;
+}
+
+bool TableStore::hasLockConflict(const Map<String, String>& row, u64 txId) {
+    if (!engine || !engine->journal) return false;
+    for (auto it = engine->journal->activeLocks.begin(); it != engine->journal->activeLocks.end(); ++it) {
+        if (it->key == txId) continue;
+        if (it->value.requiresExplicitAs && it->value.lockClauses.size() > 0) {
+            if (evaluateClauses(row, it->value.lockClauses) >= 0.0f) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool TableStore::hasLockConflictForQuery(const Array<Clauses>& queryClauses, u64 txId) {
+    if (!engine || !engine->journal) return false;
+    for (u64 rId : allRowIds) {
+        Map<String, String>* row = fetchRow(rId);
+        if (row && evaluateClauses(*row, queryClauses) >= 0.0f) {
+            if (hasLockConflict(*row, txId)) return true;
+        }
+    }
+    return false;
+}
+
 // ─── Schema Persistence ─────────────────────────────────────────────────────
 
 void TableStore::loadSchemas() {
@@ -599,6 +662,29 @@ void TableStore::loadSchemas() {
         return val;
     };
     
+    auto readStrVLU = [&]() -> String {
+        u64 len = readVLU();
+        if (len == 0 || ptr + len > end) return String();
+        String s((const u8*)ptr, len);
+        ptr += len;
+        return s;
+    };
+
+    auto readClausesVLU = [&]() -> Clauses {
+        Clauses c;
+        if (ptr >= end) return c;
+        c.isAssert = (*ptr++ != 0);
+        u64 len = readVLU();
+        for (u64 i = 0; i < len && ptr < end; ++i) {
+            Clause cl;
+            cl.col = readStrVLU();
+            cl.op = readStrVLU();
+            cl.val = readStrVLU();
+            c.push(cl);
+        }
+        return c;
+    };
+
     nextRowId = readVLU();
     u64 rc = readVLU();
     allRowIds.allocate(rc);
@@ -670,6 +756,54 @@ void TableStore::loadSchemas() {
             }
         }
     }
+
+    // Load rowHistory
+    rowHistory.clear();
+    if (ptr < end) {
+        u64 historySize = readVLU();
+        for (u64 h = 0; h < historySize && ptr < end; ++h) {
+            u64 rId = readVLU();
+            u64 versionCount = readVLU();
+            Array<RowVersion> versions;
+            versions.allocate(versionCount);
+            for (u64 v = 0; v < versionCount && ptr < end; ++v) {
+                RowVersion rv;
+                rv.seq = readVLU();
+                rv.isTombstone = (*ptr++ != 0);
+                u64 mapSize = readVLU();
+                for (u64 m = 0; m < mapSize && ptr < end; ++m) {
+                    u64 kLen = readVLU();
+                    if (end - ptr < (ptrdiff_t)kLen) break;
+                    String k((const u8*)ptr, kLen);
+                    ptr += kLen;
+                    u64 vLen = readVLU();
+                    if (end - ptr < (ptrdiff_t)vLen) break;
+                    String val((const u8*)ptr, vLen);
+                    ptr += vLen;
+                    rv.row.set(k, val);
+                }
+                versions[v] = rv;
+            }
+            rowHistory.set(rId, versions);
+        }
+    }
+
+    // Load active locks
+    if (ptr < end && engine && engine->journal) {
+        u64 activeLockCount = readVLU();
+        for (u64 l = 0; l < activeLockCount && ptr < end; ++l) {
+            u64 lockId = readVLU();
+            LockState ls;
+            ls.snapshotSeq = readVLU();
+            ls.requiresExplicitAs = (*ptr++ != 0);
+            u64 clauseCount = readVLU();
+            ls.lockClauses.allocate(clauseCount);
+            for (u64 c = 0; c < clauseCount && ptr < end; ++c) {
+                ls.lockClauses[c] = readClausesVLU();
+            }
+            engine->journal->activeLocks.set(lockId, ls);
+        }
+    }
 }
 
 void TableStore::saveSchemas() {
@@ -685,6 +819,28 @@ void TableStore::saveSchemas() {
 #endif
     needed += blobRefCounts.size() * 60; // VLU counts + hash strings
     
+    // Add space for rowHistory
+    needed += rowHistory.size() * 20;
+    for (auto it = rowHistory.begin(); it != rowHistory.end(); ++it) {
+        needed += it->value.size() * 20;
+        for (usz i = 0; i < it->value.size(); ++i) {
+            const auto& rv = it->value[i];
+            for (auto rit = rv.row.begin(); rit != rv.row.end(); ++rit) {
+                needed += rit->key.size() + rit->value.size() + 20;
+            }
+        }
+    }
+
+    // Add space for activeLocks
+    if (engine && engine->journal) {
+        needed += engine->journal->activeLocks.size() * 50;
+        for (auto it = engine->journal->activeLocks.begin(); it != engine->journal->activeLocks.end(); ++it) {
+            for (usz i = 0; i < it->value.lockClauses.size(); ++i) {
+                needed += it->value.lockClauses[i].size() * 100;
+            }
+        }
+    }
+
     String data; data.allocate(needed);
     u8* ptr = data.data();
     
@@ -696,9 +852,30 @@ void TableStore::saveSchemas() {
         *ptr++ = val & 0x7F;
     };
     
+    auto writeStrVLU = [&](const String& s) {
+        writeVLU(s.size());
+        for (usz i = 0; i < s.size(); ++i) *ptr++ = s[i];
+    };
+
+    auto writeClausesVLU = [&](const Clauses& c) {
+        *ptr++ = c.isAssert ? 1 : 0;
+        writeVLU(c.size());
+        for (usz i = 0; i < c.size(); ++i) {
+            writeStrVLU(c[i].col);
+            writeStrVLU(c[i].op);
+            writeStrVLU(c[i].val);
+        }
+    };
+
     writeVLU(nextRowId);
-    writeVLU(allRowIds.size());
-    for(usz i=0; i<allRowIds.size(); ++i) writeVLU(allRowIds[i]);
+    Array<u64> persistentRowIds;
+    for (usz i = 0; i < allRowIds.size(); ++i) {
+        if (!volatileRows.has(allRowIds[i])) {
+            persistentRowIds.push(allRowIds[i]);
+        }
+    }
+    writeVLU(persistentRowIds.size());
+    for(usz i=0; i<persistentRowIds.size(); ++i) writeVLU(persistentRowIds[i]);
     
     if (hnsw) {
         writeVLU(1);
@@ -710,8 +887,14 @@ void TableStore::saveSchemas() {
     }
     
     // Save only actual uningestedVectors (not all row IDs)
-    writeVLU(uningestedVectors.size());
-    for(usz i=0; i<uningestedVectors.size(); ++i) writeVLU(uningestedVectors[i]);
+    Array<u64> persistentUningested;
+    for (usz i = 0; i < uningestedVectors.size(); ++i) {
+        if (!volatileRows.has(uningestedVectors[i])) {
+            persistentUningested.push(uningestedVectors[i]);
+        }
+    }
+    writeVLU(persistentUningested.size());
+    for(usz i=0; i<persistentUningested.size(); ++i) writeVLU(persistentUningested[i]);
 
     // Save MVCC currentSeq
     writeVLU(currentSeq);
@@ -729,13 +912,77 @@ void TableStore::saveSchemas() {
     writeVLU(0);
 #endif
     
+    // Compute persistent blob ref counts
+    Map<String, u32> persistentBlobRefs;
+    for (auto it = rowHistory.begin(); it != rowHistory.end(); ++it) {
+        if (volatileRows.has(it->key)) continue;
+        for (usz i = 0; i < it->value.size(); ++i) {
+            const auto& rv = it->value[i];
+            if (rv.isTombstone) continue;
+            for (auto rit = rv.row.begin(); rit != rv.row.end(); ++rit) {
+                String val = rit->value;
+                if (globalKeys) val = CryptItem::decrypt(val, *globalKeys);
+                if (isBlobRef(val)) {
+                    String hash = extractBlobHash(val);
+                    if (persistentBlobRefs.has(hash)) {
+                        (*persistentBlobRefs.get(hash))++;
+                    } else {
+                        persistentBlobRefs.set(hash, 1);
+                    }
+                }
+            }
+        }
+    }
+
     // Save blobRefCounts
-    writeVLU(blobRefCounts.size());
-    for (auto it = blobRefCounts.begin(); it != blobRefCounts.end(); ++it) {
+    writeVLU(persistentBlobRefs.size());
+    for (auto it = persistentBlobRefs.begin(); it != persistentBlobRefs.end(); ++it) {
         const String& hash = it->key;
         writeVLU(hash.size());
         for (usz i = 0; i < hash.size(); ++i) *ptr++ = hash[i];
         writeVLU(it->value);
+    }
+
+    // Save rowHistory (only persistent ones)
+    u64 persistentHistorySize = 0;
+    for (auto it = rowHistory.begin(); it != rowHistory.end(); ++it) {
+        if (!volatileRows.has(it->key)) {
+            persistentHistorySize++;
+        }
+    }
+    writeVLU(persistentHistorySize);
+    for (auto it = rowHistory.begin(); it != rowHistory.end(); ++it) {
+        if (volatileRows.has(it->key)) continue;
+        writeVLU(it->key);
+        writeVLU(it->value.size());
+        for (usz i = 0; i < it->value.size(); ++i) {
+            const auto& rv = it->value[i];
+            writeVLU(rv.seq);
+            *ptr++ = rv.isTombstone ? 1 : 0;
+            writeVLU(rv.row.size());
+            for (auto rit = rv.row.begin(); rit != rv.row.end(); ++rit) {
+                writeVLU(rit->key.size());
+                for (usz j = 0; j < rit->key.size(); ++j) *ptr++ = rit->key[j];
+                writeVLU(rit->value.size());
+                for (usz j = 0; j < rit->value.size(); ++j) *ptr++ = rit->value[j];
+            }
+        }
+    }
+
+    // Save active locks
+    if (engine && engine->journal) {
+        writeVLU(engine->journal->activeLocks.size());
+        for (auto it = engine->journal->activeLocks.begin(); it != engine->journal->activeLocks.end(); ++it) {
+            writeVLU(it->key);
+            writeVLU(it->value.snapshotSeq);
+            *ptr++ = it->value.requiresExplicitAs ? 1 : 0;
+            writeVLU(it->value.lockClauses.size());
+            for (usz i = 0; i < it->value.lockClauses.size(); ++i) {
+                writeClausesVLU(it->value.lockClauses[i]);
+            }
+        }
+    } else {
+        writeVLU(0);
     }
     
     writeBlob("XYLM_TABLE_ROOT", data.slice(0, ptr - data.data()));
@@ -770,14 +1017,54 @@ void TableStore::incrementBlobRef(const String& hash) {
     }
 }
 
-void TableStore::decrementBlobRef(const String& hash) {
+void TableStore::decrementBlobRef(const String& hash, bool burn) {
     if (!blobRefCounts.has(hash)) return;
     u32& count = *blobRefCounts.get(hash);
     if (count <= 1) {
         blobRefCounts.remove(hash);
         if (blobStore && !blobStore->isFixed(hash)) {
-            auto ref = blobStore->getBlobRef(hash);
-            blobStore->setBlobUsed(ref, false);
+            if (burn) {
+                String encKey;
+                if (globalKeys && globalKeys->size() > 0) {
+                    encKey = (*globalKeys)[0];
+                }
+                
+                // Find all child diff blobs that depend on this parent 'hash'
+                Array<String> childrenToResolve;
+                for (auto it = blobStore->index.begin(); it != blobStore->index.end(); ++it) {
+                    if (it->value.isDiff && it->value.baseHash == hash) {
+                        childrenToResolve.push(it->key);
+                    }
+                }
+                
+                // For each child diff blob, read its full content and write as a full blob
+                for (usz i = 0; i < childrenToResolve.size(); ++i) {
+                    String childHash = childrenToResolve[i];
+                    auto* oldMeta = blobStore->index.get(childHash);
+                    if (oldMeta) {
+                        u32 originalRef = oldMeta->ref;
+                        bool originalUsed = oldMeta->used;
+                        u64 originalSeq = oldMeta->seq;
+                        
+                        String childData = blobStore->readHash(childHash, 0, 0xFFFFFFFF);
+                        blobStore->shredBlob(childHash);
+                        blobStore->writeHash(childHash, 0, childData, encKey);
+                        
+                        auto* newMeta = blobStore->index.get(childHash);
+                        if (newMeta) {
+                            newMeta->ref = originalRef;
+                            newMeta->used = originalUsed;
+                            newMeta->seq = originalSeq;
+                        }
+                    }
+                }
+                
+                // Finally, shred the parent blob
+                blobStore->shredBlob(hash);
+            } else {
+                auto ref = blobStore->getBlobRef(hash);
+                blobStore->setBlobUsed(ref, false);
+            }
         }
     } else {
         count--;
@@ -791,13 +1078,13 @@ bool TableStore::isBlobReferenced(const String& hash, u64 excludeRowId) {
     return false;
 }
 
-void TableStore::cleanupBlobRefs(const Map<String, String>& row, u64 /*excludeRowId*/) {
+void TableStore::cleanupBlobRefs(const Map<String, String>& row, u64 /*excludeRowId*/, bool burn) {
     if (!blobStore) return;
     for (auto it = row.begin(); it != row.end(); ++it) {
         String v = it->value;
         if (globalKeys) v = CryptItem::decrypt(v, *globalKeys);
         if (isBlobRef(v)) {
-            decrementBlobRef(extractBlobHash(v));
+            decrementBlobRef(extractBlobHash(v), burn);
         }
     }
 }
@@ -864,18 +1151,18 @@ void TableStore::invalidateColHashIndex() {
 // ─── MVCC Helpers ───────────────────────────────────────────────────────────
 
 bool TableStore::isVisibleToSnapshot(u64 rowId, u64 snapshotSeq, u64 txId) {
-    // Non-transactional reads see everything (backward compatible)
     if (snapshotSeq == 0 && txId == 0) return true;
 
-    // Check if this row was modified after our snapshot by another transaction
-    auto* modSeq = rowModSeq.get(rowId);
-    if (!modSeq) return true; // No modification info, legacy row, always visible
-    
-    // If we're in a transaction and this row was modified after our snapshot,
-    // it's still visible if WE modified it
-    // (We don't store per-tx ownership of rows, so we rely on touchedRowIds in LockState)
-    // For read visibility, we allow all committed rows visible at snapshot time
-    if (*modSeq > snapshotSeq) return false;
+    u64 createdSeq = 0;
+    auto* history = rowHistory.get(rowId);
+    if (history && history->size() > 0) {
+        createdSeq = (*history)[0].seq;
+    } else {
+        auto* modSeq = rowModSeq.get(rowId);
+        createdSeq = modSeq ? *modSeq : 0;
+    }
+
+    if (createdSeq > snapshotSeq) return false;
     return true;
 }
 
@@ -1113,6 +1400,7 @@ Array<Map<String, String>> TableStore::read(const Array<String>& columns, const 
                                              u64 length, u64 page, bool tombstones,
                                              u64 snapshotSeq, u64 txId,
                                              bool readAllColumns) {
+#define fetchRow(id) fetchRowForSnapshot(id, snapshotSeq)
     resolvePathsInClauses(clauses, snapshotSeq, txId);
     Array<Map<String, String>> result;
 
@@ -1348,7 +1636,7 @@ Array<Map<String, String>> TableStore::read(const Array<String>& columns, const 
                                     for (usz k = 0; k < childIds.size(); ++k) candidates.push(childIds[k]);
                                     hasIndex = true;
                                     break;
-                                } else if (colHashIndex.has(clause.col)) {
+                                } else if (snapshotSeq == 0 && colHashIndex.has(clause.col)) {
                                     auto* valMap = colHashIndex.get(clause.col);
                                     if (valMap->has(targetVal)) {
                                         const auto& childIds = *valMap->get(targetVal);
@@ -1413,7 +1701,7 @@ Array<Map<String, String>> TableStore::read(const Array<String>& columns, const 
                                     for (usz k = 0; k < childIds.size(); ++k) candidates.push(childIds[k]);
                                     hasIndex = true;
                                     break;
-                                } else if (colHashIndex.has(clause.col)) {
+                                } else if (snapshotSeq == 0 && colHashIndex.has(clause.col)) {
                                     auto* valMap = colHashIndex.get(clause.col);
                                     if (valMap->has(targetVal)) {
                                         const auto& childIds = *valMap->get(targetVal);
@@ -1458,7 +1746,7 @@ Array<Map<String, String>> TableStore::read(const Array<String>& columns, const 
                     if (c.op != "=") { allEq = false; break; }
                     if (c.val.startsWith("parent.")) { allEq = false; break; } 
                 }
-                if (allEq && activeGroups[0].size() > 0 && !disableIndex) {
+                if (allEq && activeGroups[0].size() > 0 && !disableIndex && snapshotSeq == 0) {
                     if (colHashIndexDirty) rebuildColHashIndex();
                     
                     bool impossible = false;
@@ -1666,6 +1954,7 @@ Array<Map<String, String>> TableStore::read(const Array<String>& columns, const 
         }
     }
 
+#undef fetchRow
     return result;
 }
 
@@ -1749,6 +2038,10 @@ int TableStore::write(const Array<Clause>& columns, const Array<Clauses>& clause
         // Also add virtual columns to the row for watcher notification (but not storage)
         // The virtual columns were already excluded from `row`.
         
+        if (hasLockConflict(row, txId)) {
+            return -1;
+        }
+
         u64 rId = nextRowId++;
         allRows.set(rId, row);
         allRowIds.push(rId);
@@ -1765,6 +2058,11 @@ int TableStore::write(const Array<Clause>& columns, const Array<Clauses>& clause
         // Update MVCC mod sequence
         currentSeq++;
         rowModSeq.set(rId, currentSeq);
+        
+        RowVersion rv;
+        rv.seq = currentSeq;
+        rv.row = row;
+        rowHistory[rId].push(rv);
         
         // Track embedding for lazy HNSW ingestion
         if (row.has("embedding")) {
@@ -1944,6 +2242,11 @@ int TableStore::write(const Array<Clause>& columns, const Array<Clauses>& clause
             // Update MVCC mod sequence
             currentSeq++;
             rowModSeq.set(rId, currentSeq);
+            
+            RowVersion rv;
+            rv.seq = currentSeq;
+            rv.row = *row;
+            rowHistory[rId].push(rv);
             if (isVolatile) volatileRows.set(rId, true);
             else dirtyBlocks.set(rId / 1000, true);
             
@@ -1951,6 +2254,31 @@ int TableStore::write(const Array<Clause>& columns, const Array<Clauses>& clause
             updateLru(rId);
         }
     };
+
+    // Validate lock conflicts for all target update rows
+    const Array<u64>& checkIds = fastPathUsed ? candidateIds : allRowIds;
+    for (u64 rId : checkIds) {
+        Map<String, String>* row = fetchRow(rId);
+        if (row && evaluateClauses(*row, clauses, nullptr, rId) >= 0.0f) {
+            if (hasLockConflict(*row, txId)) {
+                return -1;
+            }
+            // Check if the updated row would conflict
+            Map<String, String> updatedRow = *row;
+            for (const auto& col : columns) {
+                ParsedCol pc = parseCol(col.col);
+                if (pc.type == ColType::WATCH) continue;
+                if (col.val == "") {
+                    updatedRow.remove(pc.name);
+                } else {
+                    updatedRow.set(pc.name, col.val);
+                }
+            }
+            if (hasLockConflict(updatedRow, txId)) {
+                return -1;
+            }
+        }
+    }
 
     if (fastPathUsed) {
         Array<u64> targets;
@@ -1973,7 +2301,7 @@ int TableStore::write(const Array<Clause>& columns, const Array<Clauses>& clause
 
 // ─── Remove ─────────────────────────────────────────────────────────────────
 
-bool TableStore::rm(const Array<Clauses>& clauses, u64 length) {
+bool TableStore::rm(const Array<Clauses>& clauses, u64 length, bool burn) {
     resolvePathsInClauses(clauses, currentSeq, 0);
 
     Array<u64> toRemove;
@@ -2034,6 +2362,16 @@ bool TableStore::rm(const Array<Clauses>& clauses, u64 length) {
             }
         }
     }
+
+    // Lock check: if any matching items are locked, fail the entire operation
+    for (usz i = 0; i < toRemove.size(); ++i) {
+        u64 rId = toRemove[i];
+        Map<String, String>* row = fetchRow(rId);
+        if (row && hasLockConflict(*row, 0)) {
+            return false;
+        }
+    }
+
     for (usz i = 0; i < toRemove.size(); ++i) {
         u64 rId = toRemove[i];
         Map<String, String>* row = fetchRow(rId);
@@ -2066,35 +2404,48 @@ bool TableStore::rm(const Array<Clauses>& clauses, u64 length) {
                 }
             }
             
-            // Cleanup blob references
-            cleanupBlobRefs(*row, rId);
-            
-            currentMemoryBytes -= approxRowBytes(*row);
-            allRows.remove(rId);
-        } else if (hnsw) {
-            hnsw->remove(rId);
-        }
-        for(usz j=0; j<allRowIds.size(); ++j) {
-            if(allRowIds[j] == rId) {
-                allRowIds[j] = allRowIds[allRowIds.size() - 1];
-                allRowIds.pop();
-                break;
+            if (burn) {
+                cleanupBlobRefs(*row, rId, true);
+                currentMemoryBytes -= approxRowBytes(*row);
+                allRows.remove(rId);
+                rowHistory.remove(rId);
+                
+                for(usz j=0; j<allRowIds.size(); ++j) {
+                    if(allRowIds[j] == rId) {
+                        allRowIds[j] = allRowIds[allRowIds.size() - 1];
+                        allRowIds.pop();
+                        break;
+                    }
+                }
+                allRowIdsMap.remove(rId);
+                for(usz j=0; j<uningestedVectors.size(); ++j) {
+                    if(uningestedVectors[j] == rId) {
+                        uningestedVectors[j] = uningestedVectors[uningestedVectors.size() - 1];
+                        uningestedVectors.pop();
+                        break;
+                    }
+                }
+                if (!volatileRows.has(rId)) {
+                    dirtyBlocks.set(rId / 1000, true);
+                }
+                rowModSeq.remove(rId);
+                volatileRows.remove(rId);
+            } else {
+                currentSeq++;
+                RowVersion rv;
+                rv.seq = currentSeq;
+                rv.isTombstone = true;
+                rowHistory[rId].push(rv);
+                
+                rowModSeq.set(rId, currentSeq);
+                
+                currentMemoryBytes -= approxRowBytes(*row);
+                allRows.remove(rId);
+                if (!volatileRows.has(rId)) {
+                    dirtyBlocks.set(rId / 1000, true);
+                }
             }
         }
-        allRowIdsMap.remove(rId);
-        for(usz j=0; j<uningestedVectors.size(); ++j) {
-            if(uningestedVectors[j] == rId) {
-                uningestedVectors[j] = uningestedVectors[uningestedVectors.size() - 1];
-                uningestedVectors.pop();
-                break;
-            }
-        }
-        // Clean up MVCC tracking
-        if (!volatileRows.has(rId)) {
-            dirtyBlocks.set(rId / 1000, true);
-        }
-        rowModSeq.remove(rId);
-        volatileRows.remove(rId);
     }
     colBloomFiltersDirty = true;
     return true;

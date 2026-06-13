@@ -482,6 +482,53 @@ bool BlobStore::removeHash(const String& hash) {
     return true;
 }
 
+bool BlobStore::shredBlob(const String& hash) {
+    auto* m = index.get(hash);
+    if (!m) return false;
+
+    if (m->frozen && m->fixedPosition != 0) {
+        if (device && device->config.onDeviceWrite) {
+            u32 blockSize = device->config.blockSize;
+            u32 startBlock = (u32)(m->fixedPosition / blockSize);
+            u32 endBlock = (u32)((m->fixedPosition + m->originalSize + blockSize - 1) / blockSize);
+            String shredBuf; shredBuf.allocate(blockSize); shredBuf.fill(0xFF);
+            for (u32 b = startBlock; b < endBlock; ++b) {
+                u16 ec = (allocator && b < allocator->bam.size()) ? allocator->bam[b].eraseCount : 0u;
+                device->writeBlock(b, ec, shredBuf);
+            }
+        }
+        if (thawCallback) thawCallback(m->fixedPosition, m->fixedPosition + m->originalSize);
+    } else if (device && allocator && m->blockIdx != 0) {
+        u32 blockIdx = m->blockIdx;
+        u32 blockSize = device->config.blockSize;
+        String shredBuf; shredBuf.allocate(blockSize); shredBuf.fill(0xFF);
+        while (blockIdx != 0) {
+            u16 ec = (blockIdx < allocator->bam.size()) ? allocator->bam[blockIdx].eraseCount : 0u;
+            String blockData = device->readBlock(blockIdx, ec);
+
+            u32 nextBlock = 0;
+            if ((u32)blockData.size() >= CONT_OVERHEAD) {
+                const u8* ptr = (const u8*)blockData.data();
+                ptr++;               // type
+                u8 isFirst = *ptr++;
+                u8 kLen    = *ptr++;
+                if (isFirst) ptr += kLen;
+                ptr += 4; // totalDataLen
+                ptr += 4; // thisChunkLen
+                nextBlock = *(u32*)ptr;
+            }
+
+            device->writeBlock(blockIdx, ec, shredBuf);
+            allocator->freeBlock(blockIdx);
+            blockIdx = nextBlock;
+        }
+    }
+
+    index.remove(hash);
+    bloomRebuild();
+    return true;
+}
+
 bool BlobStore::fixBlob(const String& hash, u64 byteAddress) {
     auto* m = index.get(hash);
     if (!m || !device || !allocator) return false;

@@ -10,6 +10,8 @@
 #include <Xylem/Cache.hpp>
 #include <Xylem/Watcher.hpp>
 #include <Xylem/QueryParser.hpp>
+#include <functional>
+#include <stdio.h>
 
 namespace Xylem {
 
@@ -43,7 +45,8 @@ public:
               u64 txId = 0, const String& encryptionKey = "");
     int writeVolatile(const Array<Clause>& columns, const Array<Clauses>& clauses = Array<Clauses>(),
                       u64 txId = 0, const String& encryptionKey = "");
-    bool rm(const Array<Clauses>& clauses, u64 length = 0, u64 as = 0);
+    bool rm(const Array<Clauses>& clauses, u64 length = 0, u64 as = 0, bool burn = false);
+    bool burn(const Array<Clauses>& clauses, u64 length = 0, u64 as = 0) { return rm(clauses, length, as, true); }
 
 
     // Transactions (MVCC)
@@ -106,9 +109,73 @@ public:
     bool unwatch(u64 id);
     Array<Map<String,String>> pull(u64 id);
 
+    TableStore* getTableStore() { return tableStore; }
+    usz getActiveLocksCount() { return journal ? journal->activeLocks.size() : 0; }
+    void printActiveLocks() {
+        if (!journal) { printf("No journal\n"); return; }
+        printf("Active locks (%d):\n", (int)journal->activeLocks.size());
+        for (auto it = journal->activeLocks.begin(); it != journal->activeLocks.end(); ++it) {
+            printf("  ID: %llu, requiresExplicitAs: %d, clauses: %d\n", 
+                   (unsigned long long)it->key, 
+                   it->value.requiresExplicitAs ? 1 : 0,
+                   (int)it->value.lockClauses.size());
+        }
+    }
+
+    // ─── Query Overlay Registrations ──────────────────────────────────────────
+    struct OverlayReadRegistration {
+        Array<Clauses> clauses;
+        bool supportsPath;
+        std::function<Array<Map<String, String>>(const Array<Clauses>& clauses, const Array<Clauses>& asserts)> callback;
+    };
+    struct OverlayWriteRegistration {
+        Array<Clauses> clauses;
+        std::function<bool(const Array<Clause>& columns, const Array<Clauses>& clauses)> callback;
+    };
+    struct ClauseOperationRegistration {
+        String op;
+        std::function<bool(const Clause& clause, const Map<String, String>& row, bool& result)> callback;
+    };
+    struct QueryRegistration {
+        String op;
+        std::function<QueryResult(const String& queryString, XylemEngine* engine)> callback;
+    };
+
+    Array<OverlayReadRegistration> overlayReads;
+    Array<OverlayWriteRegistration> overlayWrites;
+    Array<ClauseOperationRegistration> clauseOperations;
+    Array<QueryRegistration> queryCallbacks;
+
+    void onOverlayRead(const Array<Clauses>& clauses, bool supportsPath, std::function<Array<Map<String, String>>(const Array<Clauses>&, const Array<Clauses>&)> cb) {
+        OverlayReadRegistration reg;
+        reg.clauses = clauses;
+        reg.supportsPath = supportsPath;
+        reg.callback = cb;
+        overlayReads.push(reg);
+    }
+    void onOverlayWrite(const Array<Clauses>& clauses, std::function<bool(const Array<Clause>&, const Array<Clauses>&)> cb) {
+        OverlayWriteRegistration reg;
+        reg.clauses = clauses;
+        reg.callback = cb;
+        overlayWrites.push(reg);
+    }
+    void onClauseOperation(const String& op, std::function<bool(const Clause&, const Map<String, String>&, bool&)> cb) {
+        ClauseOperationRegistration reg;
+        reg.op = op;
+        reg.callback = cb;
+        clauseOperations.push(reg);
+    }
+    void onQuery(const String& op, std::function<QueryResult(const String&, XylemEngine*)> cb) {
+        QueryRegistration reg;
+        reg.op = op;
+        reg.callback = cb;
+        queryCallbacks.push(reg);
+    }
+
 private:
     friend class QueryParser;
     friend class XylemServer;
+    friend class TableStore;
 
     u8 pinnedRawBits[1024];
     u32 currentSuperblockIdx = 0xFFFFFFFFu;

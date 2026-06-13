@@ -748,6 +748,226 @@ int main() {
     Error("Query Parser pagination (LIMIT and PAGE) failed!");
   }
 
+  // --- Ported/New Feature: Clause-based locks (preventing future inserts) ---
+  Info("Testing Clause-based locking and conflict detection...");
+  xm.printActiveLocks();
+  // Start a transaction with a clause predicate: tag = 'locked_tag'
+  Array<Clauses> lockClauses;
+  lockClauses.push(WHERE("tag", "=", "locked_tag"));
+  u64 txLock = xm.lock(lockClauses, 0, true);
+  if (txLock > 0) {
+    Success("Clause lock successfully created.");
+  } else {
+    Error("Failed to create clause lock!");
+  }
+
+  // Attempt to write matching row in a different transaction context (txId = 0)
+  Array<Clause> matchingInsert;
+  matchingInsert.push({"id", "=", "9000"});
+  matchingInsert.push({"tag", "=", "locked_tag"});
+  matchingInsert.push({"content", "=", "blocked"});
+  int blockedWriteRes = xm.write(matchingInsert, {}, 0);
+  if (blockedWriteRes == -1) {
+    Success("Matching insert successfully blocked by active clause lock!");
+  } else {
+    Error("Active clause lock failed to block matching insert! code=" + String::from((u64)blockedWriteRes));
+  }
+
+  // Attempt to write non-matching row (tag = 'free_tag')
+  Array<Clause> freeInsert;
+  freeInsert.push({"id", "=", "9001"});
+  freeInsert.push({"tag", "=", "free_tag"});
+  freeInsert.push({"content", "=", "free"});
+  int freeWriteRes = xm.write(freeInsert, {}, 0);
+  if (freeWriteRes == 0) {
+    Success("Non-matching insert successfully bypasses clause lock.");
+  } else {
+    Error("Non-matching insert was blocked incorrectly! code=" + String::from((u64)freeWriteRes));
+    xm.printActiveLocks();
+  }
+
+  // Unlock the transaction to release the lock
+  xm.unlock(txLock);
+  
+  // Try writing the matching row again now that the lock is released
+  int writeAfterCommit = xm.write(matchingInsert, {}, 0);
+  if (writeAfterCommit == 0) {
+    Success("Insert succeeded after clause lock was committed.");
+  } else {
+    Error("Insert failed even after clause lock was committed! code=" + String::from((u64)writeAfterCommit));
+    xm.printActiveLocks();
+  }
+
+  // --- Ported/New Feature: Snapshot reads returning historical version data ---
+  Info("Testing snapshot reads and historical version visibility...");
+  // Set up a row
+  Array<Clause> mvccRowNew;
+  mvccRowNew.push({"id", "=", "9100"});
+  mvccRowNew.push({"tag", "=", "mvcc_test"});
+  mvccRowNew.push({"value", "=", "v1"});
+  xm.write(mvccRowNew);
+
+  // Start a transaction txId to capture the snapshot sequence (without locking writes)
+  u64 txMvcc = xm.lock(Array<Clauses>(), 0, false);
+  
+  // Modify the row value to 'v2' outside the transaction
+  Array<Clause> mvccUpdateNew;
+  mvccUpdateNew.push({"value", "=", "v2"});
+  xm.write(mvccUpdateNew, OR(WHERE("id", "=", "9100")), 0);
+
+  // Read inside transaction txMvcc -> should return 'v1'
+  Array<String> mvccCols; mvccCols.push("value");
+  auto mvccReadTx = xm.read(mvccCols, OR(WHERE("id", "=", "9100")), 0, 0, false, txMvcc);
+  if (mvccReadTx.size() == 1 && mvccReadTx[0]["value"] == "v1") {
+    Success("Snapshot read correctly returned historical version ('v1').");
+  } else {
+    Error("Snapshot read failed to return historical version!");
+  }
+
+  // Read outside transaction -> should return 'v2'
+  auto mvccReadNonTx = xm.read(mvccCols, OR(WHERE("id", "=", "9100")), 0, 0);
+  if (mvccReadNonTx.size() == 1 && mvccReadNonTx[0]["value"] == "v2") {
+    Success("Normal read correctly returned updated version ('v2').");
+  } else {
+    Error("Normal read failed to return updated version!");
+  }
+
+  // Delete the row outside the transaction (writes a tombstone)
+  xm.rm(OR(WHERE("id", "=", "9100")));
+
+  // Read inside transaction txMvcc -> should STILL return 'v1'
+  auto mvccReadTxAfterDel = xm.read(mvccCols, OR(WHERE("id", "=", "9100")), 0, 0, false, txMvcc);
+  if (mvccReadTxAfterDel.size() == 1 && mvccReadTxAfterDel[0]["value"] == "v1") {
+    Success("Snapshot read correctly returned historical version after deletion.");
+  } else {
+    Error("Snapshot read failed to return historical version after deletion!");
+  }
+
+  // Read outside transaction -> should return nothing (tombstone active)
+  auto mvccReadNonTxAfterDel = xm.read(mvccCols, OR(WHERE("id", "=", "9100")), 0, 0);
+  if (mvccReadNonTxAfterDel.size() == 0) {
+    Success("Normal read correctly returned empty results after deletion.");
+  } else {
+    Error("Normal read returned deleted row!");
+  }
+
+  xm.unlock(txMvcc);
+
+  // --- Ported/New Feature: Physical shredding on BURN ---
+  Info("Testing physical shredding on BURN...");
+  Array<Clause> burnRow;
+  burnRow.push({"id", "=", "9200"});
+  burnRow.push({"tag", "=", "burn_test"});
+  burnRow.push({"content:blob", "=", "burnable_secret_blob_content"});
+  xm.write(burnRow);
+
+  // Retrieve the blob hash
+  String burnBlobRef;
+  auto* tsInit = xm.getTableStore();
+  if (tsInit) {
+    for (u64 rId : tsInit->allRowIds) {
+      auto* r = tsInit->fetchRow(rId);
+      if (r && r->has("id") && *r->get("id") == "9200") {
+        if (r->has("content")) {
+          burnBlobRef = *r->get("content");
+        }
+      }
+    }
+  }
+  
+  if (!burnBlobRef.isEmpty() && isBlobRef(burnBlobRef)) {
+    String burnHash = extractBlobHash(burnBlobRef);
+    u32 bRef = xm.getBlobRef(burnHash);
+    u32 bSize = xm.getBlobSize(bRef);
+    Success("Created secret blob: hash=" + burnHash + ", size=" + String::from((u64)bSize));
+    
+    // Perform physical BURN
+    bool burnSuccess = xm.burn(OR(WHERE("id", "=", "9200")));
+    if (burnSuccess) {
+      Success("BURN operation successfully executed.");
+    } else {
+      Error("BURN operation failed!");
+    }
+    
+    // Verify row is physically purged from allRowIds (not just a tombstone)
+    Array<String> idCols; idCols.push("id");
+    auto readBurnedRow = xm.read(idCols, OR(WHERE("id", "=", "9200")));
+    if (readBurnedRow.size() == 0) {
+      // Unmount and remount to confirm it didn't write a tombstone version, but fully deleted the ID
+      xm.destroy();
+      xm.mount();
+      
+      bool idFoundInStore = false;
+      auto* ts = xm.getTableStore();
+      if (ts) {
+        for (u64 rId : ts->allRowIds) {
+          Map<String, String>* r = ts->fetchRow(rId);
+          if (r && r->has("id") && *r->get("id") == "9200") {
+            idFoundInStore = true; break;
+          }
+        }
+      }
+      if (!idFoundInStore) {
+        Success("Row was physically deleted and purged from allRowIds.");
+      } else {
+        Error("Row ID was not purged from allRowIds!");
+      }
+      
+      // Verify blob is shredded (size is 0 / removed)
+      u32 afterBurnRef = xm.getBlobRef(burnHash);
+      u32 afterBurnSize = xm.getBlobSize(afterBurnRef);
+      if (afterBurnSize == 0) {
+        Success("Blob was physically shredded / wiped successfully.");
+      } else {
+        Error("Blob still exists on device after BURN! Size=" + String::from((u64)afterBurnSize));
+      }
+    } else {
+      Error("Burned row is still readable!");
+    }
+  } else {
+    Error("Failed to write blob for BURN test!");
+  }
+
+  // --- Ported/New Feature: Overlay callback interception ---
+  Info("Testing Query Overlay callbacks...");
+  
+  // Register overlay read callback
+  xm.onOverlayRead(OR(WHERE("tag", "=", "overlay_test")), false, 
+                   [](const Array<Clauses>& clauses, const Array<Clauses>& asserts) -> Array<Map<String, String>> {
+                       Array<Map<String, String>> mockRows;
+                       Map<String, String> row;
+                       row.set("id", "99999");
+                       row.set("tag", "overlay_test");
+                       row.set("value", "mocked_overlay_data");
+                       mockRows.push(row);
+                       return mockRows;
+                   });
+                   
+  // Query using query engine -> should match overlay and return mock data
+  QueryResult overlayRes = xm.query("READ id, value WHERE tag='overlay_test'");
+  if (overlayRes.readRows.size() == 1 && overlayRes.readRows[0]["value"] == "mocked_overlay_data") {
+    Success("Overlay read callback successfully intercepted query and returned mock row.");
+  } else {
+    Error("Overlay read callback failed to intercept query!");
+  }
+
+  // Register custom command query callback
+  xm.onQuery("CUSTOM_ECHO", [](const String& queryString, XylemEngine* engine) -> QueryResult {
+      QueryResult res;
+      res.code = 12345;
+      Map<String, String> row;
+      row.set("msg", "echo_response");
+      res.readRows.push(row);
+      return res;
+  });
+  
+  QueryResult customQueryRes = xm.query("CUSTOM_ECHO hello_world");
+  if (customQueryRes.code == 12345 && customQueryRes.readRows.size() == 1 && customQueryRes.readRows[0]["msg"] == "echo_response") {
+    Success("Overlay custom query callback successfully registered and executed.");
+  } else {
+    Error("Overlay custom query callback failed!");
+  }
+
   Success("All tests successfully completed!");
   xm.destroy();
   close(fd);

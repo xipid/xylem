@@ -1,80 +1,134 @@
 # MVCC & Transactions
 
-Xylem implements **Multi-Version Concurrency Control (MVCC)** to provide safe, ACID transactions. In MVCC, writers do not block readers, and readers do not block writers. Each transaction operates on an isolated snapshot of the database state.
-
-## Dynamic Row Locking
-To begin a transaction, you lock a set of database entities (rows) by specifying identifying clauses. This returns a transaction ID:
-
-```cpp
-// Lock all rows associated with Alice's account
-u64 txId = xm.lock({WHERE("account", "=", "Alice")});
-```
-
-All subsequent operations within the transaction must supply this `txId` to maintain safety.
-
-## Conflict Detection (Write-Write)
-If two transactions try to modify the same rows at the same time, Xylem detects a write-write conflict:
-*   The first transaction to write and commit will succeed.
-*   The second transaction will fail upon `unlock()` with a return code of `-2` (MVCC conflict) and its changes will be automatically rolled back.
-
-```cpp
-// Start transaction
-u64 tx1 = xm.lock();
-
-// Outside transaction, someone writes to the same rows (advances modSeq)
-xm.write({{"counter", "=", "1"}}, {WHERE("id", "=", "shared")});
-
-// Inside transaction, try to write to same row
-xm.write({{"counter", "=", "2"}}, {WHERE("id", "=", "shared")}, tx1);
-
-// Unlocking tx1 will return -2 (MVCC conflict)
-int res = xm.unlock(tx1);
-if (res == -2) {
-    // Write-write conflict detected! Changes discarded safely.
-}
-```
-
-## Atomic Commits & Rollbacks
-If all operations inside the transaction are successful, commit the transaction using `unlock()`:
-```cpp
-xm.unlock(txId);
-```
-If you encounter an error or want to cancel the changes, discard the transaction using `rollback()`:
-```cpp
-xm.rollback(txId);
-```
-
-## Pessimistic Locks (Seamless Snapshots)
-If you need to guarantee that no other queries alter the database during your transaction (creating a seamless snapshot for backups, consistent state reads, or strict exclusive operations), you can pass `requiresExplicitAs = true` when locking:
-
-```cpp
-u64 snapId = xm.lock(Array<Clauses>(), 0, true /* requiresExplicitAs */);
-```
-
-When this flag is set, **every** modifying operation (e.g., `write`, `remove`, `graphWrite`) on the database must explicitly pass this `snapId`. Any queries attempting to bypass the lock (passing `txId = 0` or another `txId`) will be immediately blocked and return `-1`. This effectively freezes the database for all clients except the lock holder.
+Xylem implements **Multi-Version Concurrency Control (MVCC)** alongside predicate-based locking to provide safe, highly-concurrent, and ACID-compliant transactions. Under MVCC:
+- Readers do not block writers, and writers do not block readers.
+- Each transaction operates on an isolated snapshot of the database state captured at a specific sequence number (`snapshotSeq`).
+- Historical versions of updated or deleted (tombstone) rows are kept in memory and on disk as long as active transactions reference their sequence numbers.
 
 ---
 
-## ASSERT Queries
-You can include an `ASSERT` condition in your read or write queries. If any database item matches the criteria specified by an `ASSERT`, the query fails immediately.
-*   For writes, it prevents modification. The method returns the 1-based index of the ASSERT clause that failed the check.
-*   For reads, it short-circuits the pipeline and returns 0 rows.
+## Clause-Based Predicate Locking
 
-### Usage in Writes:
+Xylem features **Predicate Locks (Clause-Based Locking)**. Instead of locking specific row IDs, transactions lock database queries by specifying filter clauses.
+
+These locks are dynamic and **support future items**: any write or remove operation attempting to insert or update a row that would match the locked clauses is blocked until the transaction is committed or rolled back.
+
+### API Usage
+To begin a transaction and acquire a predicate lock, call `lock` with an array of query clauses:
+
 ```cpp
-// Try to write, but assert that no entry with 'status=failed' already exists
+// Start a transaction that locks all items where tag = "locked_tag"
+Array<Clauses> lockClauses;
+lockClauses.push(WHERE("tag", "=", "locked_tag"));
+
+u64 txLock = xm.lock(lockClauses, 0, true /* requiresExplicitAs */);
+```
+
+### Future Insert Prevention
+If another process attempts to insert or update a row that satisfies the predicate (`tag = "locked_tag"`), it will be blocked:
+
+```cpp
+// Attempting to write a matching row in a different transaction context
+Array<Clause> item;
+item.push({"id", "=", "9000"});
+item.push({"tag", "=", "locked_tag"});
+item.push({"content", "=", "blocked"});
+
+int res = xm.write(item, {}, 0); // Returns -1 (Blocked by active clause lock)
+```
+
+Non-matching writes (e.g., `tag = "free_tag"`) can proceed concurrently without interruption:
+
+```cpp
+Array<Clause> freeItem;
+freeItem.push({"id", "=", "9001"});
+freeItem.push({"tag", "=", "free_tag"});
+
+int res = xm.write(freeItem, {}, 0); // Returns 0 (Success)
+```
+
+---
+
+## MVCC Snapshot Versioning & Reads
+
+Xylem preserves historical row versions to isolate readers from concurrent writes. When a transaction starts, it receives a `snapshotSeq` representing the current sequence number of the database.
+
+### Version History
+When a row is updated, a new `RowVersion` is appended to its history rather than overwriting it in-place.
+When a row is removed, a tombstone (`isTombstone = true`) version is appended.
+
+### Reading from Snapshots
+Queries performed inside a transaction automatically fetch the version of the row that was active at the transaction's `snapshotSeq`.
+
+```cpp
+// Set up a row
+Array<Clause> row;
+row.push({"id", "=", "9100"});
+row.push({"value", "=", "v1"});
+xm.write(row);
+
+// Start transaction to capture snapshotSeq
+u64 tx = xm.lock(Array<Clauses>(), 0, false /* requiresExplicitAs = false allows concurrent writes */);
+
+// Update row value outside transaction
+Array<Clause> update;
+update.push({"value", "=", "v2"});
+xm.write(update, OR(WHERE("id", "=", "9100")), 0);
+
+// Read inside the transaction snapshot -> returns "v1"
+auto txResults = xm.read({"value"}, OR(WHERE("id", "=", "9100")), 0, 0, false, tx);
+assert(txResults[0]["value"] == "v1");
+
+// Read outside transaction -> returns the latest version "v2"
+auto normalResults = xm.read({"value"}, OR(WHERE("id", "=", "9100")), 0, 0);
+assert(normalResults[0]["value"] == "v2");
+```
+
+### Version Garbage Collection
+To prevent the database from growing indefinitely, Xylem implements version garbage collection (`gcVersions`). Superseded historical versions and tombstoned rows are automatically purged once there are no active snapshot transactions referencing sequence numbers older than the version sequence.
+
+---
+
+## Write-Write Conflict Detection
+
+If two concurrent transactions modify overlapping sets of rows, Xylem automatically detects a write-write conflict:
+- The transaction that commits (`unlock`) first succeeds.
+- Any conflicting transaction will fail to commit, returning `-2` (MVCC conflict) on `unlock()`, and its changes are automatically rolled back.
+
+---
+
+## Pessimistic locks (Blocking writes)
+
+If you need to guarantee that no other client or query writes to the database or to a matching subset of the database, you can specify `requiresExplicitAs = true` when acquiring a lock:
+
+```cpp
+// Global Write Lock: blocks all modifications outside this transaction
+u64 snapId = xm.lock(Array<Clauses>(), 0, true /* requiresExplicitAs */);
+```
+
+When `requiresExplicitAs` is `true`:
+- All modifications (`write`, `rm`, etc.) must pass the transaction ID (e.g. `as = snapId`).
+- Modifications attempting to bypass the lock (passing `txId = 0` or another `txId`) are blocked and return `-1`.
+- If clauses are specified (e.g., `lock(clauses, 0, true)`), the block is limited only to writes matching the filter clauses.
+
+---
+
+## ASSERT Clauses
+
+You can include `ASSERT` clauses in your queries to perform conditional check-and-write operations. If any database item matches the criteria specified by an `ASSERT`, the query fails immediately.
+
+- **Writes**: If any row matches the assert clause, the write fails and returns the 1-based index of the failed `ASSERT` clause.
+- **Reads**: If any row matches the assert clause, the read is short-circuited and returns `0` rows.
+
+### Usage in C++:
+```cpp
+// Write, but fail if there is any row matching 'status = failed'
 int result = xm.write(
-    {{"new_id", "=", "item_99"}},
-    {ASSERT_WHERE("status", "=", "failed")} // Fails write if found
+    {{"id", "=", "item_99"}, {"status", "=", "running"}},
+    {ASSERT_WHERE("status", "=", "failed")}
 );
 
 if (result > 0) {
-    // Assert failed! 'result' represents the index of the failed clause.
+    // Assert triggered! 'result' is the index of the failed clause.
 }
 ```
-### Usage in Queries (Sanitized String API):
-In the custom query language, this is written as:
-```
-WRITE name=test WHERE age > 25 ASSERT status=active
-```
-If an active item matches the target, the execution halts.

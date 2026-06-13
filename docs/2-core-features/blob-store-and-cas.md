@@ -89,5 +89,38 @@ xm.write(
 
 ## Automatic Garbage Collection (Reference Counting)
 Xylem tracks references to blobs stored inside tables.
-*   When a row containing a `:blob` is deleted (tombstoned), Xylem checks the entire database to see if any other row references the same blob hash.
+*   When a row containing a `:blob` is deleted (soft-deleted / tombstoned), Xylem checks the entire database to see if any other row references the same blob hash.
 *   If no other references exist, and the blob is not pinned to a physical address (`fixHash`), the physical blob data is **deleted automatically** to reclaim space.
+
+---
+
+## BURN (Physical Shredding)
+
+For high-security requirements where data must be irrevocably erased, Xylem supports a `BURN` operation. Unlike standard removals (which write soft-delete tombstones for MVCC and lazily garbage-collect blobs), `BURN` performs an immediate, physical wipe.
+
+### Behavior
+1. **Permanent Wiping**: The matching database rows are immediately and permanently removed from database lists (no tombstones are kept).
+2. **Blob Shredding**: The associated blobs are overwritten on the physical medium (shredded) to prevent raw data recovery.
+3. **Lock Prevention**: If any row matching the burn query is locked by an active predicate lock, the `BURN` operation is immediately aborted and returns `false`.
+
+### Parent-Child Diff Dependency Merging
+To optimize disk usage, Xylem's blob system allows writing subsequent versions of a blob as a *diff* relative to its parent blob. 
+
+If a parent blob is targeted by a `BURN` operation but has child blobs that still depend on it:
+1. Xylem traverses the dependency tree of the blob.
+2. It reconstructs the child blobs using the parent content and the diffs.
+3. It rewrites the child blobs as full, independent, standalone blobs.
+4. Only after all children are rewritten and no longer depend on the parent, Xylem shreds the parent blob.
+
+This guarantees database integrity while fully satisfying the shredding request.
+
+### API Usage
+In C++, pass `burn = true` to `rm`, or call `burn`:
+
+```cpp
+// Permanently erase matching items and shred their blobs
+bool success = xm.rm(OR(WHERE("tag", "=", "confidential")), 0, 0, true /* burn = true */);
+// Or call the helper:
+bool success = xm.burn(OR(WHERE("tag", "=", "confidential")));
+```
+

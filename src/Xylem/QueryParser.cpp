@@ -459,8 +459,8 @@ QueryResult QueryParser::execute(XylemEngine* engine, const String& queryStr, co
         return res;
     }
 
-    // ─── RM command ───
-    if (baseCmd == "RM") {
+    // ─── RM/BURN command ───
+    if (baseCmd == "RM" || baseCmd == "BURN") {
         if (tokens.size() < 2) { res.code = -1; return res; }
         String firstArg = tokens[1];
         
@@ -477,7 +477,7 @@ QueryResult QueryParser::execute(XylemEngine* engine, const String& queryStr, co
         }
         
         parseClausesFromTokens(tokens, idx, queryClauses);
-        res.code = engine->rm(queryClauses) ? 0 : -1;
+        res.code = engine->rm(queryClauses, 0, 0, baseCmd == "BURN") ? 0 : -1;
         return res;
     }
 
@@ -633,7 +633,7 @@ QueryResult QueryParser::execute(XylemEngine* engine, const String& queryStr, co
 
     // Standard CRUD (READ, WRITE, WRITEVOLATILE, RM)
     bool isRead = (cmd == "READ" || cmd == "READ*");
-    if (isRead || cmd == "WRITE" || cmd == "WRITEVOLATILE" || cmd == "RM") {
+    if (isRead || cmd == "WRITE" || cmd == "WRITEVOLATILE" || cmd == "RM" || cmd == "BURN") {
         bool readAllColumns = (cmd == "READ*");
         Array<String> columns;
         Array<Clause> writeCols;
@@ -704,8 +704,8 @@ QueryResult QueryParser::execute(XylemEngine* engine, const String& queryStr, co
             } else {
                 res.code = engine->writeVolatile(writeCols, queryClauses);
             }
-        } else if (cmd == "RM") {
-            res.code = engine->rm(queryClauses) ? 0 : -1;
+        } else if (cmd == "RM" || cmd == "BURN") {
+            res.code = engine->rm(queryClauses, 0, 0, cmd == "BURN") ? 0 : -1;
         }
         return res;
     }
