@@ -10,6 +10,7 @@
 #include <cstdlib>
 
 
+
 namespace Xylem {
 
 static bool isRegexSyntax(const String& pattern) {
@@ -433,62 +434,403 @@ TableStore::TableStore(BlockDevice* dev, Allocator* alloc, Array<String>* keys)
     : device(dev), allocator(alloc), globalKeys(keys) {}
 
 Array<u64> TableStore::getMatchingRowIds(const Array<Clauses>& clauses, u64 snapshotSeq, u64 txId) {
+#define fetchRow(id) fetchRowForSnapshot(id, snapshotSeq)
     resolvePathsInClauses(clauses, snapshotSeq, txId);
-    Array<u64> result;
-    Array<u64> candidateIds;
-    bool fastPathUsed = false;
-    if (clauses.size() == 1) { 
-        bool allEq = true;
-        for (const auto& c : clauses[0]) {
-            if (c.op != "=") { allEq = false; break; }
-            if (c.val.startsWith("parent.")) { allEq = false; break; } 
+    
+    if (colBloomFiltersDirty) rebuildBloomFilters();
+
+    Array<QueryStep> steps = groupAndExpandClauses(clauses, this);
+
+    if (steps.size() == 0) {
+        QueryStep allStep;
+        allStep.isFollow = false;
+        allStep.isRepeatFollow = false;
+        allStep.isAssert = false;
+        steps.push(allStep);
+    }
+    Map<String, u64> idToRowId;
+    Map<String, Array<u64>> parentToRowIds;
+    for (u64 rId : allRowIds) {
+        if (!isVisibleToSnapshot(rId, snapshotSeq, txId)) continue;
+        Map<String, String>* row = fetchRow(rId);
+        if (!row) continue;
+        
+        String idVal = row->has("id") ? *row->get("id") : "";
+        if (globalKeys) idVal = CryptItem::decrypt(idVal, *globalKeys);
+        if (!idVal.isEmpty()) {
+            idToRowId.set(idVal, rId);
         }
-        if (allEq && clauses[0].size() > 0 && !clauses[0].isAssert && !disableIndex) {
-            if (colHashIndexDirty) rebuildColHashIndex();
-            
-            bool impossible = false;
-            bool firstCol = true;
-            for (const auto& c : clauses[0]) {
-                auto* valMap = colHashIndex.get(c.col);
-                if (!valMap) { impossible = true; break; } 
-                
-                auto* rowIds = valMap->get(c.val);
-                if (!rowIds) { impossible = true; break; } 
-                
-                if (firstCol) {
-                    candidateIds = *rowIds;
-                    firstCol = false;
-                } else {
-                    Array<u64> intersected;
-                    for (u64 rId : *rowIds) {
-                        for (u64 crId : candidateIds) {
-                            if (rId == crId) { intersected.push(rId); break; }
-                        }
-                    }
-                    candidateIds = intersected;
-                    if (candidateIds.size() == 0) { impossible = true; break; }
-                }
-            }
-            if (!impossible) {
-                fastPathUsed = true;
-            }
-        }
+        
+        String pId = row->has("parent_id") ? *row->get("parent_id") : "";
+        if (globalKeys) pId = CryptItem::decrypt(pId, *globalKeys);
+        parentToRowIds[pId].push(rId);
     }
 
-    const Array<u64>& scanList = fastPathUsed ? candidateIds : allRowIds;
-    for (u64 rId : scanList) {
-        if (!isVisibleToSnapshot(rId, snapshotSeq, txId)) {
-            continue;
+    Array<u64> currentRows;
+    Array<u64> assertRows;
+    bool inAssertPath = false;
+
+    for (usz si = 0; si < steps.size(); ++si) {
+        const QueryStep& step = steps[si];
+
+        // Apply Bloom filter check to filter step.groups
+        Array<Clauses> activeGroups;
+        for (const auto& group : step.groups) {
+            bool groupImpossible = false;
+            if (snapshotSeq == 0) {
+                for (const auto& clause : group) {
+                    if ((clause.op == "=" || clause.op == "==") && !clause.val.startsWith("parent.")) {
+                        if (clause.col == "parent_id" && clause.val == "") {
+                            continue;
+                        }
+                        if (colBloomFilters.has(clause.col)) {
+                            auto* bf = colBloomFilters.get(clause.col);
+                            if (bf && !(*bf)->contains(clause.val)) {
+                                groupImpossible = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if (!groupImpossible) {
+                activeGroups.push(group);
+            }
         }
-        Map<String, String>* row = fetchRow(rId);
-        if (row) {
-            f32 score = evaluateClauses(*row, clauses, nullptr, rId);
-            if (score >= 0.0f) {
-                result.push(rId);
+
+        if (step.isAssert) {
+            bool startsAssertPath = false;
+            if (!inAssertPath) {
+                for (const auto& group : activeGroups) {
+                    for (const auto& clause : group) {
+                        if ((clause.col == "parent_id" && clause.val == "") || clause.op == "path") {
+                            startsAssertPath = true;
+                            break;
+                        }
+                    }
+                    if (startsAssertPath) break;
+                }
+            }
+
+            if (startsAssertPath) {
+                inAssertPath = true;
+                assertRows.clear();
+            }
+
+            if (inAssertPath) {
+                if (activeGroups.size() == 0) {
+                    assertRows.clear();
+                } else if (startsAssertPath) {
+                    for (u64 rId : allRowIds) {
+                        if (!isVisibleToSnapshot(rId, snapshotSeq, txId)) continue;
+                        Map<String, String>* row = fetchRow(rId);
+                        if (!row) continue;
+                        if (activeGroups.size() == 0 || evaluateClauses(*row, activeGroups, nullptr, rId) >= 0.0f) {
+                            assertRows.push(rId);
+                        }
+                    }
+                } else if (step.isFollow) {
+                    Array<u64> nextRows;
+                    for (usz rIdx = 0; rIdx < assertRows.size(); ++rIdx) {
+                        u64 parentId = assertRows[rIdx];
+                        Map<String, String>* parentRow = fetchRow(parentId);
+                        if (!parentRow) continue;
+
+                        Array<u64> candidates;
+                        bool hasIndex = false;
+                        for (const auto& group : activeGroups) {
+                            for (const auto& clause : group) {
+                                if (clause.op == "=" && clause.val.startsWith("parent.")) {
+                                    String pKey = clause.val.substring(7);
+                                    if (parentRow->has(pKey)) {
+                                        String targetVal = *parentRow->get(pKey);
+                                        if (clause.col == "parent_id" && parentToRowIds.has(targetVal)) {
+                                            const auto& childIds = *parentToRowIds.get(targetVal);
+                                            for (usz k = 0; k < childIds.size(); ++k) candidates.push(childIds[k]);
+                                            hasIndex = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            if (hasIndex) break;
+                        }
+
+                        const Array<u64>& scanList = hasIndex ? candidates : allRowIds;
+                        for (u64 rId : scanList) {
+                            if (!isVisibleToSnapshot(rId, snapshotSeq, txId)) continue;
+                            Map<String, String>* row = fetchRow(rId);
+                            if (!row) continue;
+                            if (evaluateClauses(*row, activeGroups, parentRow, rId) >= 0.0f) {
+                                bool alreadyAdded = false;
+                                for (usz k = 0; k < nextRows.size(); ++k) {
+                                    if (nextRows[k] == rId) { alreadyAdded = true; break; }
+                                }
+                                if (!alreadyAdded) nextRows.push(rId);
+                            }
+                        }
+                    }
+                    assertRows = nextRows;
+                } else if (step.isRepeatFollow) {
+                    Array<u64> nextRows;
+                    nextRows.allocate(assertRows.size());
+                    for (usz k = 0; k < assertRows.size(); ++k) nextRows[k] = assertRows[k];
+                    
+                    Array<u64> queue;
+                    queue.allocate(assertRows.size());
+                    for (usz k = 0; k < assertRows.size(); ++k) queue[k] = assertRows[k];
+                    Map<u64, bool> visited;
+                    for (usz k = 0; k < assertRows.size(); ++k) visited.set(assertRows[k], true);
+
+                    usz qIdx = 0;
+                    while (qIdx < queue.size()) {
+                        u64 parentId = queue[qIdx++];
+                        Map<String, String>* parentRow = fetchRow(parentId);
+                        if (!parentRow) continue;
+
+                        Array<u64> candidates;
+                        bool hasIndex = false;
+                        for (const auto& group : activeGroups) {
+                            for (const auto& clause : group) {
+                                if (clause.op == "=" && clause.val.startsWith("parent.")) {
+                                    String pKey = clause.val.substring(7);
+                                    if (parentRow->has(pKey)) {
+                                        String targetVal = *parentRow->get(pKey);
+                                        if (clause.col == "parent_id" && parentToRowIds.has(targetVal)) {
+                                            const auto& childIds = *parentToRowIds.get(targetVal);
+                                            for (usz k = 0; k < childIds.size(); ++k) candidates.push(childIds[k]);
+                                            hasIndex = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            if (hasIndex) break;
+                        }
+
+                        const Array<u64>& scanList = hasIndex ? candidates : allRowIds;
+                        for (u64 rId : scanList) {
+                            if (!isVisibleToSnapshot(rId, snapshotSeq, txId)) continue;
+                            if (visited.has(rId)) continue;
+                            Map<String, String>* row = fetchRow(rId);
+                            if (!row) continue;
+                            if (evaluateClauses(*row, activeGroups, parentRow, rId) >= 0.0f) {
+                                visited.set(rId, true);
+                                queue.push(rId);
+                                nextRows.push(rId);
+                            }
+                        }
+                    }
+                    assertRows = nextRows;
+                }
+
+                bool nextIsAssert = (si + 1 < steps.size() && steps[si+1].isAssert);
+                if (!nextIsAssert) {
+                    if (assertRows.size() == 0) {
+#undef fetchRow
+                        return {};
+                    }
+                    inAssertPath = false;
+                }
+            } else {
+                if (currentRows.size() == 0 || activeGroups.size() == 0) {
+#undef fetchRow
+                    return {};
+                }
+                for (usz rIdx = 0; rIdx < currentRows.size(); ++rIdx) {
+                    u64 rId = currentRows[rIdx];
+                    Map<String, String>* row = fetchRow(rId);
+                    if (!row || evaluateClauses(*row, activeGroups, nullptr, rId) < 0.0f) {
+#undef fetchRow
+                        return {};
+                    }
+                }
+            }
+        } else if (step.isFollow) {
+            inAssertPath = false;
+            if (activeGroups.size() == 0) {
+                currentRows.clear();
+                continue;
+            }
+            Array<u64> nextRows;
+            for (usz rIdx = 0; rIdx < currentRows.size(); ++rIdx) {
+                u64 parentId = currentRows[rIdx];
+                Map<String, String>* parentRow = fetchRow(parentId);
+                if (!parentRow) continue;
+
+                Array<u64> candidates;
+                bool hasIndex = false;
+                for (const auto& group : activeGroups) {
+                    for (const auto& clause : group) {
+                        if (clause.op == "=" && clause.val.startsWith("parent.")) {
+                            String pKey = clause.val.substring(7);
+                            if (parentRow->has(pKey)) {
+                                String targetVal = *parentRow->get(pKey);
+                                if (clause.col == "parent_id" && parentToRowIds.has(targetVal)) {
+                                    const auto& childIds = *parentToRowIds.get(targetVal);
+                                    for (usz k = 0; k < childIds.size(); ++k) candidates.push(childIds[k]);
+                                    hasIndex = true;
+                                    break;
+                                } else if (snapshotSeq == 0 && colHashIndex.has(clause.col)) {
+                                    auto* valMap = colHashIndex.get(clause.col);
+                                    if (valMap->has(targetVal)) {
+                                        const auto& childIds = *valMap->get(targetVal);
+                                        for (usz k = 0; k < childIds.size(); ++k) candidates.push(childIds[k]);
+                                        hasIndex = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if (hasIndex) break;
+                }
+
+                const Array<u64>& scanList = hasIndex ? candidates : allRowIds;
+                for (u64 rId : scanList) {
+                    if (!isVisibleToSnapshot(rId, snapshotSeq, txId)) continue;
+                    Map<String, String>* row = fetchRow(rId);
+                    if (!row) continue;
+                    if (evaluateClauses(*row, activeGroups, parentRow, rId) >= 0.0f) {
+                        bool alreadyAdded = false;
+                        for (usz k = 0; k < nextRows.size(); ++k) {
+                            if (nextRows[k] == rId) { alreadyAdded = true; break; }
+                        }
+                        if (!alreadyAdded) nextRows.push(rId);
+                    }
+                }
+            }
+            currentRows = nextRows;
+        } else if (step.isRepeatFollow) {
+            inAssertPath = false;
+            if (activeGroups.size() == 0) {
+                currentRows.clear();
+                continue;
+            }
+            Array<u64> nextRows;
+            nextRows.allocate(currentRows.size());
+            for (usz k = 0; k < currentRows.size(); ++k) nextRows[k] = currentRows[k];
+            
+            Array<u64> queue;
+            queue.allocate(currentRows.size());
+            for (usz k = 0; k < currentRows.size(); ++k) queue[k] = currentRows[k];
+            Map<u64, bool> visited;
+            for (usz k = 0; k < currentRows.size(); ++k) visited.set(currentRows[k], true);
+
+            usz qIdx = 0;
+            while (qIdx < queue.size()) {
+                u64 parentId = queue[qIdx++];
+                Map<String, String>* parentRow = fetchRow(parentId);
+                if (!parentRow) continue;
+
+                Array<u64> candidates;
+                bool hasIndex = false;
+                for (const auto& group : activeGroups) {
+                    for (const auto& clause : group) {
+                        if (clause.op == "=" && clause.val.startsWith("parent.")) {
+                            String pKey = clause.val.substring(7);
+                            if (parentRow->has(pKey)) {
+                                String targetVal = *parentRow->get(pKey);
+                                if (clause.col == "parent_id" && parentToRowIds.has(targetVal)) {
+                                    const auto& childIds = *parentToRowIds.get(targetVal);
+                                    for (usz k = 0; k < childIds.size(); ++k) candidates.push(childIds[k]);
+                                    hasIndex = true;
+                                    break;
+                                } else if (snapshotSeq == 0 && colHashIndex.has(clause.col)) {
+                                    auto* valMap = colHashIndex.get(clause.col);
+                                    if (valMap->has(targetVal)) {
+                                        const auto& childIds = *valMap->get(targetVal);
+                                        for (usz k = 0; k < childIds.size(); ++k) candidates.push(childIds[k]);
+                                        hasIndex = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if (hasIndex) break;
+                }
+
+                const Array<u64>& scanList = hasIndex ? candidates : allRowIds;
+                for (u64 rId : scanList) {
+                    if (!isVisibleToSnapshot(rId, snapshotSeq, txId)) continue;
+                    if (visited.has(rId)) continue;
+                    Map<String, String>* row = fetchRow(rId);
+                    if (!row) continue;
+                    if (evaluateClauses(*row, activeGroups, parentRow, rId) >= 0.0f) {
+                        visited.set(rId, true);
+                        queue.push(rId);
+                        nextRows.push(rId);
+                    }
+                }
+            }
+            currentRows = nextRows;
+        } else {
+            inAssertPath = false;
+            if (activeGroups.size() == 0) {
+                if (step.groups.size() > 0) {
+                    currentRows.clear();
+                }
+                continue;
+            }
+            Array<u64> candidates;
+            bool fastPathUsed = false;
+            if (activeGroups.size() == 1) { 
+                bool allEq = true;
+                for (const auto& c : activeGroups[0]) {
+                    if (c.op != "=") { allEq = false; break; }
+                    if (c.val.startsWith("parent.")) { allEq = false; break; } 
+                }
+                if (allEq && activeGroups[0].size() > 0 && !disableIndex && snapshotSeq == 0) {
+                    if (colHashIndexDirty) rebuildColHashIndex();
+                    
+                    bool impossible = false;
+                    bool firstCol = true;
+                    for (const auto& c : activeGroups[0]) {
+                        auto* valMap = colHashIndex.get(c.col);
+                        if (!valMap) { impossible = true; break; } 
+                        
+                        auto* rowIds = valMap->get(c.val);
+                        if (!rowIds) { impossible = true; break; } 
+                        
+                        if (firstCol) {
+                            candidates = *rowIds;
+                            firstCol = false;
+                        } else {
+                            Array<u64> intersected;
+                            for (u64 rId : *rowIds) {
+                                for (u64 crId : candidates) {
+                                    if (rId == crId) { intersected.push(rId); break; }
+                                }
+                            }
+                            candidates = intersected;
+                            if (candidates.size() == 0) { impossible = true; break; }
+                        }
+                    }
+                    if (!impossible) {
+                        fastPathUsed = true;
+                    }
+                }
+            }
+
+            const Array<u64>& scanList = fastPathUsed ? candidates : allRowIds;
+            for (u64 rId : scanList) {
+                if (!isVisibleToSnapshot(rId, snapshotSeq, txId)) {
+                    continue;
+                }
+                Map<String, String>* row = fetchRow(rId);
+                if (!row) {
+                    continue;
+                }
+                f32 score = evaluateClauses(*row, activeGroups, nullptr, rId);
+                if (activeGroups.size() == 0 || score >= 0.0f) {
+                    currentRows.push(rId);
+                }
             }
         }
     }
-    return result;
+#undef fetchRow
+    return currentRows;
 }
 
 TableStore::~TableStore() {
@@ -1401,399 +1743,8 @@ Array<Map<String, String>> TableStore::read(const Array<String>& columns, const 
                                              u64 snapshotSeq, u64 txId,
                                              bool readAllColumns) {
 #define fetchRow(id) fetchRowForSnapshot(id, snapshotSeq)
-    resolvePathsInClauses(clauses, snapshotSeq, txId);
+    Array<u64> currentRows = getMatchingRowIds(clauses, snapshotSeq, txId);
     Array<Map<String, String>> result;
-
-    if (colBloomFiltersDirty) rebuildBloomFilters();
-
-    Array<QueryStep> steps = groupAndExpandClauses(clauses, this);
-
-    if (steps.size() == 0) {
-        QueryStep allStep;
-        allStep.isFollow = false;
-        allStep.isRepeatFollow = false;
-        allStep.isAssert = false;
-        steps.push(allStep);
-    }
-    Map<String, u64> idToRowId;
-    Map<String, Array<u64>> parentToRowIds;
-    for (u64 rId : allRowIds) {
-        if (!isVisibleToSnapshot(rId, snapshotSeq, txId)) continue;
-        Map<String, String>* row = fetchRow(rId);
-        if (!row) continue;
-        
-        String idVal = row->has("id") ? *row->get("id") : "";
-        if (globalKeys) idVal = CryptItem::decrypt(idVal, *globalKeys);
-        if (!idVal.isEmpty()) {
-            idToRowId.set(idVal, rId);
-        }
-        
-        String pId = row->has("parent_id") ? *row->get("parent_id") : "";
-        if (globalKeys) pId = CryptItem::decrypt(pId, *globalKeys);
-        parentToRowIds[pId].push(rId);
-    }
-
-
-
-    Array<u64> currentRows;
-    Array<u64> assertRows;
-    bool inAssertPath = false;
-
-    for (usz si = 0; si < steps.size(); ++si) {
-        const QueryStep& step = steps[si];
-
-        // Apply Bloom filter check to filter step.groups
-        Array<Clauses> activeGroups;
-        for (const auto& group : step.groups) {
-            bool groupImpossible = false;
-            for (const auto& clause : group) {
-                if ((clause.op == "=" || clause.op == "==") && !clause.val.startsWith("parent.")) {
-                    if (clause.col == "parent_id" && clause.val == "") {
-                        continue;
-                    }
-                    if (colBloomFilters.has(clause.col)) {
-                        auto* bf = colBloomFilters.get(clause.col);
-                        if (bf && !(*bf)->contains(clause.val)) {
-                            groupImpossible = true;
-                            break;
-                        }
-                    }
-                }
-            }
-            if (!groupImpossible) {
-                activeGroups.push(group);
-            }
-        }
-
-        if (step.isAssert) {
-            // Check if this step starts a new assert path
-            bool startsAssertPath = false;
-            if (!inAssertPath) {
-                for (const auto& group : activeGroups) {
-                    for (const auto& clause : group) {
-                        if ((clause.col == "parent_id" && clause.val == "") || clause.op == "path") {
-                            startsAssertPath = true;
-                            break;
-                        }
-                    }
-                    if (startsAssertPath) break;
-                }
-            }
-
-            if (startsAssertPath) {
-                inAssertPath = true;
-                assertRows.clear();
-            }
-
-            if (inAssertPath) {
-                if (activeGroups.size() == 0) {
-                    assertRows.clear();
-                } else if (startsAssertPath) {
-                    for (u64 rId : allRowIds) {
-                        if (!isVisibleToSnapshot(rId, snapshotSeq, txId)) continue;
-                        Map<String, String>* row = fetchRow(rId);
-                        if (!row) continue;
-                        if (activeGroups.size() == 0 || evaluateClauses(*row, activeGroups, nullptr, rId) >= 0.0f) {
-                            assertRows.push(rId);
-                        }
-                    }
-                } else if (step.isFollow) {
-                    Array<u64> nextRows;
-                    for (usz rIdx = 0; rIdx < assertRows.size(); ++rIdx) {
-                        u64 parentId = assertRows[rIdx];
-                        Map<String, String>* parentRow = fetchRow(parentId);
-                        if (!parentRow) continue;
-
-                        Array<u64> candidates;
-                        bool hasIndex = false;
-                        for (const auto& group : activeGroups) {
-                            for (const auto& clause : group) {
-                                if (clause.op == "=" && clause.val.startsWith("parent.")) {
-                                    String pKey = clause.val.substring(7);
-                                    if (parentRow->has(pKey)) {
-                                        String targetVal = *parentRow->get(pKey);
-                                        if (clause.col == "parent_id" && parentToRowIds.has(targetVal)) {
-                                            const auto& childIds = *parentToRowIds.get(targetVal);
-                                            for (usz k = 0; k < childIds.size(); ++k) candidates.push(childIds[k]);
-                                            hasIndex = true;
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                            if (hasIndex) break;
-                        }
-
-                        const Array<u64>& scanList = hasIndex ? candidates : allRowIds;
-                        for (u64 rId : scanList) {
-                            if (!isVisibleToSnapshot(rId, snapshotSeq, txId)) continue;
-                            Map<String, String>* row = fetchRow(rId);
-                            if (!row) continue;
-                            if (evaluateClauses(*row, activeGroups, parentRow, rId) >= 0.0f) {
-                                bool alreadyAdded = false;
-                                for (usz k = 0; k < nextRows.size(); ++k) {
-                                    if (nextRows[k] == rId) { alreadyAdded = true; break; }
-                                }
-                                if (!alreadyAdded) nextRows.push(rId);
-                            }
-                        }
-                    }
-                    assertRows = nextRows;
-                } else if (step.isRepeatFollow) {
-                    Array<u64> nextRows;
-                    nextRows.allocate(assertRows.size());
-                    for (usz k = 0; k < assertRows.size(); ++k) nextRows[k] = assertRows[k];
-                    
-                    Array<u64> queue;
-                    queue.allocate(assertRows.size());
-                    for (usz k = 0; k < assertRows.size(); ++k) queue[k] = assertRows[k];
-                    Map<u64, bool> visited;
-                    for (usz k = 0; k < assertRows.size(); ++k) visited.set(assertRows[k], true);
-
-                    usz qIdx = 0;
-                    while (qIdx < queue.size()) {
-                        u64 parentId = queue[qIdx++];
-                        Map<String, String>* parentRow = fetchRow(parentId);
-                        if (!parentRow) continue;
-
-                        Array<u64> candidates;
-                        bool hasIndex = false;
-                        for (const auto& group : activeGroups) {
-                            for (const auto& clause : group) {
-                                if (clause.op == "=" && clause.val.startsWith("parent.")) {
-                                    String pKey = clause.val.substring(7);
-                                    if (parentRow->has(pKey)) {
-                                        String targetVal = *parentRow->get(pKey);
-                                        if (clause.col == "parent_id" && parentToRowIds.has(targetVal)) {
-                                            const auto& childIds = *parentToRowIds.get(targetVal);
-                                            for (usz k = 0; k < childIds.size(); ++k) candidates.push(childIds[k]);
-                                            hasIndex = true;
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                            if (hasIndex) break;
-                        }
-
-                        const Array<u64>& scanList = hasIndex ? candidates : allRowIds;
-                        for (u64 rId : scanList) {
-                            if (!isVisibleToSnapshot(rId, snapshotSeq, txId)) continue;
-                            if (visited.has(rId)) continue;
-                            Map<String, String>* row = fetchRow(rId);
-                            if (!row) continue;
-                            if (evaluateClauses(*row, activeGroups, parentRow, rId) >= 0.0f) {
-                                visited.set(rId, true);
-                                queue.push(rId);
-                                nextRows.push(rId);
-                            }
-                        }
-                    }
-                    assertRows = nextRows;
-                }
-
-                bool nextIsAssert = (si + 1 < steps.size() && steps[si+1].isAssert);
-                if (!nextIsAssert) {
-                    if (assertRows.size() == 0) {
-                        return {};
-                    }
-                    inAssertPath = false;
-                }
-            } else {
-                if (currentRows.size() == 0 || activeGroups.size() == 0) {
-                    return {};
-                }
-                for (usz rIdx = 0; rIdx < currentRows.size(); ++rIdx) {
-                    u64 rId = currentRows[rIdx];
-                    Map<String, String>* row = fetchRow(rId);
-                    if (!row || evaluateClauses(*row, activeGroups, nullptr, rId) < 0.0f) {
-                        return {};
-                    }
-                }
-            }
-        } else if (step.isFollow) {
-            inAssertPath = false;
-            if (activeGroups.size() == 0) {
-                currentRows.clear();
-                continue;
-            }
-            Array<u64> nextRows;
-            for (usz rIdx = 0; rIdx < currentRows.size(); ++rIdx) {
-                u64 parentId = currentRows[rIdx];
-                Map<String, String>* parentRow = fetchRow(parentId);
-                if (!parentRow) continue;
-
-                Array<u64> candidates;
-                bool hasIndex = false;
-                for (const auto& group : activeGroups) {
-                    for (const auto& clause : group) {
-                        if (clause.op == "=" && clause.val.startsWith("parent.")) {
-                            String pKey = clause.val.substring(7);
-                            if (parentRow->has(pKey)) {
-                                String targetVal = *parentRow->get(pKey);
-                                if (clause.col == "parent_id" && parentToRowIds.has(targetVal)) {
-                                    const auto& childIds = *parentToRowIds.get(targetVal);
-                                    for (usz k = 0; k < childIds.size(); ++k) candidates.push(childIds[k]);
-                                    hasIndex = true;
-                                    break;
-                                } else if (snapshotSeq == 0 && colHashIndex.has(clause.col)) {
-                                    auto* valMap = colHashIndex.get(clause.col);
-                                    if (valMap->has(targetVal)) {
-                                        const auto& childIds = *valMap->get(targetVal);
-                                        for (usz k = 0; k < childIds.size(); ++k) candidates.push(childIds[k]);
-                                        hasIndex = true;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if (hasIndex) break;
-                }
-
-                const Array<u64>& scanList = hasIndex ? candidates : allRowIds;
-                for (u64 rId : scanList) {
-                    if (!isVisibleToSnapshot(rId, snapshotSeq, txId)) continue;
-                    Map<String, String>* row = fetchRow(rId);
-                    if (!row) continue;
-                    if (evaluateClauses(*row, activeGroups, parentRow, rId) >= 0.0f) {
-                        bool alreadyAdded = false;
-                        for (usz k = 0; k < nextRows.size(); ++k) {
-                            if (nextRows[k] == rId) { alreadyAdded = true; break; }
-                        }
-                        if (!alreadyAdded) nextRows.push(rId);
-                    }
-                }
-            }
-            currentRows = nextRows;
-        } else if (step.isRepeatFollow) {
-            inAssertPath = false;
-            if (activeGroups.size() == 0) {
-                currentRows.clear();
-                continue;
-            }
-            Array<u64> nextRows;
-            nextRows.allocate(currentRows.size());
-            for (usz k = 0; k < currentRows.size(); ++k) nextRows[k] = currentRows[k];
-            
-            Array<u64> queue;
-            queue.allocate(currentRows.size());
-            for (usz k = 0; k < currentRows.size(); ++k) queue[k] = currentRows[k];
-            Map<u64, bool> visited;
-            for (usz k = 0; k < currentRows.size(); ++k) visited.set(currentRows[k], true);
-
-            usz qIdx = 0;
-            while (qIdx < queue.size()) {
-                u64 parentId = queue[qIdx++];
-                Map<String, String>* parentRow = fetchRow(parentId);
-                if (!parentRow) continue;
-
-                Array<u64> candidates;
-                bool hasIndex = false;
-                for (const auto& group : activeGroups) {
-                    for (const auto& clause : group) {
-                        if (clause.op == "=" && clause.val.startsWith("parent.")) {
-                            String pKey = clause.val.substring(7);
-                            if (parentRow->has(pKey)) {
-                                String targetVal = *parentRow->get(pKey);
-                                if (clause.col == "parent_id" && parentToRowIds.has(targetVal)) {
-                                    const auto& childIds = *parentToRowIds.get(targetVal);
-                                    for (usz k = 0; k < childIds.size(); ++k) candidates.push(childIds[k]);
-                                    hasIndex = true;
-                                    break;
-                                } else if (snapshotSeq == 0 && colHashIndex.has(clause.col)) {
-                                    auto* valMap = colHashIndex.get(clause.col);
-                                    if (valMap->has(targetVal)) {
-                                        const auto& childIds = *valMap->get(targetVal);
-                                        for (usz k = 0; k < childIds.size(); ++k) candidates.push(childIds[k]);
-                                        hasIndex = true;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if (hasIndex) break;
-                }
-
-                const Array<u64>& scanList = hasIndex ? candidates : allRowIds;
-                for (u64 rId : scanList) {
-                    if (!isVisibleToSnapshot(rId, snapshotSeq, txId)) continue;
-                    if (visited.has(rId)) continue;
-                    Map<String, String>* row = fetchRow(rId);
-                    if (!row) continue;
-                    if (evaluateClauses(*row, activeGroups, parentRow, rId) >= 0.0f) {
-                        visited.set(rId, true);
-                        queue.push(rId);
-                        nextRows.push(rId);
-                    }
-                }
-            }
-            currentRows = nextRows;
-        } else {
-            inAssertPath = false;
-            if (activeGroups.size() == 0) {
-                if (step.groups.size() > 0) {
-                    currentRows.clear();
-                }
-                continue;
-            }
-            Array<u64> candidates;
-            bool fastPathUsed = false;
-            if (activeGroups.size() == 1) { 
-                bool allEq = true;
-                for (const auto& c : activeGroups[0]) {
-                    if (c.op != "=") { allEq = false; break; }
-                    if (c.val.startsWith("parent.")) { allEq = false; break; } 
-                }
-                if (allEq && activeGroups[0].size() > 0 && !disableIndex && snapshotSeq == 0) {
-                    if (colHashIndexDirty) rebuildColHashIndex();
-                    
-                    bool impossible = false;
-                    bool firstCol = true;
-                    for (const auto& c : activeGroups[0]) {
-                        auto* valMap = colHashIndex.get(c.col);
-                        if (!valMap) { impossible = true; break; } 
-                        
-                        auto* rowIds = valMap->get(c.val);
-                        if (!rowIds) { impossible = true; break; } 
-                        
-                        if (firstCol) {
-                            candidates = *rowIds;
-                            firstCol = false;
-                        } else {
-                            Array<u64> intersected;
-                            for (u64 rId : *rowIds) {
-                                for (u64 crId : candidates) {
-                                    if (rId == crId) { intersected.push(rId); break; }
-                                }
-                            }
-                            candidates = intersected;
-                            if (candidates.size() == 0) { impossible = true; break; }
-                        }
-                    }
-                    if (!impossible) {
-                        fastPathUsed = true;
-                    }
-                }
-            }
-
-            const Array<u64>& scanList = fastPathUsed ? candidates : allRowIds;
-            for (u64 rId : scanList) {
-                if (!isVisibleToSnapshot(rId, snapshotSeq, txId)) {
-                    continue;
-                }
-                Map<String, String>* row = fetchRow(rId);
-                if (!row) {
-                    continue;
-                }
-                f32 score = evaluateClauses(*row, activeGroups, nullptr, rId);
-                if (activeGroups.size() == 0 || score >= 0.0f) {
-                    currentRows.push(rId);
-                }
-            }
-        }
-    }
 
     auto applySelect = [&](Map<String, String>& row) -> Map<String, String> {
         Map<String, String> outRow;
@@ -1900,6 +1851,7 @@ Array<Map<String, String>> TableStore::read(const Array<String>& columns, const 
         return outRow;
     };
 
+    Array<QueryStep> steps = groupAndExpandClauses(clauses, this);
     const Clause* cosClause = nullptr;
     if (steps.size() > 0 && steps[0].groups.size() > 0 && steps[0].groups[0].size() > 0 && steps[0].groups[0][0].op == "cos") {
         cosClause = &steps[0].groups[0][0];
@@ -2103,163 +2055,12 @@ int TableStore::write(const Array<Clause>& columns, const Array<Clauses>& clause
     }
     
     // ─── Update ─────────────────────────────────────────────────────────────
-    Array<u64> candidateIds;
-    bool fastPathUsed = false;
-    if (clauses.size() == 1) { 
-        bool allEq = true;
-        for (const auto& c : clauses[0]) {
-            if (c.op != "=") { allEq = false; break; }
-            if (c.val.startsWith("parent.")) { allEq = false; break; } 
-        }
-        if (allEq && clauses[0].size() > 0 && !clauses[0].isAssert && !disableIndex) {
-            if (colHashIndexDirty) rebuildColHashIndex();
-            
-            bool impossible = false;
-            bool firstCol = true;
-            for (const auto& c : clauses[0]) {
-                auto* valMap = colHashIndex.get(c.col);
-                if (!valMap) { impossible = true; break; } 
-                
-                auto* rowIds = valMap->get(c.val);
-                if (!rowIds) { impossible = true; break; } 
-                
-                if (firstCol) {
-                    candidateIds = *rowIds;
-                    firstCol = false;
-                } else {
-                    Array<u64> intersected;
-                    for (u64 rId : *rowIds) {
-                        for (u64 crId : candidateIds) {
-                            if (rId == crId) { intersected.push(rId); break; }
-                        }
-                    }
-                    candidateIds = intersected;
-                    if (candidateIds.size() == 0) { impossible = true; break; }
-                }
-            }
-            if (!impossible) {
-                fastPathUsed = true;
-            }
-        }
-    }
-
-    auto doUpdateRow = [&](u64 rId) {
-        Map<String, String>* row = fetchRow(rId);
-        if (!row) return;
-        if (evaluateClauses(*row, clauses, nullptr, rId) >= 0.0f) {
-            currentMemoryBytes -= approxRowBytes(*row);
-            String keyToUse = encryptionKey;
-            if (keyToUse.isEmpty() && globalKeys) {
-                for (const auto& existingCol : columns) {
-                    ParsedCol pc = parseCol(existingCol.col);
-                    if (row->has(pc.name)) {
-                        String dummyKey;
-                        CryptItem::decrypt(*row->get(pc.name), *globalKeys, &dummyKey);
-                        if (!dummyKey.isEmpty()) {
-                            keyToUse = dummyKey;
-                            break;
-                        }
-                    }
-                }
-            }
-            
-            for (const auto& col : columns) {
-                ParsedCol pc = parseCol(col.col);
-                if (pc.type == ColType::WATCH) continue; // Skip watch in updates
-                
-                String oldBlobHashToDecrement;
-                if (row->has(pc.name)) {
-                    String oldV = *row->get(pc.name);
-                    if (globalKeys) oldV = CryptItem::decrypt(oldV, *globalKeys);
-                    else if (!keyToUse.isEmpty()) {
-                        Array<String> tempKeys; tempKeys.push(keyToUse);
-                        oldV = CryptItem::decrypt(oldV, tempKeys);
-                    }
-                    if (isBlobRef(oldV)) {
-                        oldBlobHashToDecrement = extractBlobHash(oldV);
-                    }
-                    
-                    // Remove rId from colHashIndex[pc.name][oldV]
-                    if (!colHashIndexDirty && pc.name != "content" && oldV.size() <= 256 && colHashIndex.has(pc.name)) {
-                        auto* valMap = colHashIndex.get(pc.name);
-                        if (valMap->has(oldV)) {
-                            auto* rowIds = valMap->get(oldV);
-                            for (usz j = 0; j < rowIds->size(); ++j) {
-                                if ((*rowIds)[j] == rId) {
-                                    (*rowIds)[j] = (*rowIds)[rowIds->size() - 1];
-                                    rowIds->pop();
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if (col.val == "") {
-                    // Setting a column to "" means removing that column
-                    if (row->has(pc.name)) {
-                        row->remove(pc.name);
-                    }
-                } else if (pc.type == ColType::BLOB && blobStore) {
-                    String content = col.val;
-                    // Handle partial blob writes
-                    if (pc.rangeSpec.size() > 0) {
-                        BlobRange br = parseBlobRange(pc.rangeSpec);
-                        if (br.valid && row->has(pc.name)) {
-                            String existing = resolveValue(*row->get(pc.name));
-                            content = applyBlobRange(existing, col.val, br);
-                        }
-                    }
-                    String hash = Security::hash(content, 16);
-                    blobStore->writeHash(hash, 0, content, keyToUse, oldBlobHashToDecrement, currentSeq);
-                    incrementBlobRef(hash);
-                    String ref = makeBlobRef(hash);
-                    row->set(pc.name, keyToUse.isEmpty() ? ref : CryptItem::encrypt(ref, keyToUse));
-                } else {
-                    row->set(pc.name, keyToUse.isEmpty() ? col.val : CryptItem::encrypt(col.val, keyToUse));
-                }
-
-                // Add newVal to colHashIndex[pc.name][newVal] (only if column was not removed)
-                if (col.val != "" && !colHashIndexDirty && pc.name != "content" && row->has(pc.name)) {
-                    String newVal = *row->get(pc.name);
-                    if (newVal.size() <= 256) {
-                        if (globalKeys) newVal = CryptItem::decrypt(newVal, *globalKeys);
-                        else if (!keyToUse.isEmpty()) {
-                            Array<String> tempKeys; tempKeys.push(keyToUse);
-                            newVal = CryptItem::decrypt(newVal, tempKeys);
-                        }
-                        if (!colHashIndex.has(pc.name)) colHashIndex.set(pc.name, Map<String, Array<u64>>());
-                        colHashIndex.get(pc.name)->operator[](newVal).push(rId);
-                    }
-                }
-
-                // Decrement old blob ref now that the new value has been set
-                if (!oldBlobHashToDecrement.isEmpty()) {
-                    decrementBlobRef(oldBlobHashToDecrement);
-                }
-            }
-            
-            // Update MVCC mod sequence
-            currentSeq++;
-            rowModSeq.set(rId, currentSeq);
-            
-            RowVersion rv;
-            rv.seq = currentSeq;
-            rv.row = *row;
-            rowHistory[rId].push(rv);
-            if (isVolatile) volatileRows.set(rId, true);
-            else dirtyBlocks.set(rId / 1000, true);
-            
-            currentMemoryBytes += approxRowBytes(*row);
-            updateLru(rId);
-        }
-    };
+    Array<u64> targets = getMatchingRowIds(clauses, currentSeq, txId);
 
     // Validate lock conflicts for all target update rows
-    const Array<u64>& checkIds = fastPathUsed ? candidateIds : allRowIds;
-    for (u64 rId : checkIds) {
+    for (u64 rId : targets) {
         Map<String, String>* row = fetchRow(rId);
-        if (row && evaluateClauses(*row, clauses, nullptr, rId) >= 0.0f) {
+        if (row) {
             if (hasLockConflict(*row, txId)) {
                 return -1;
             }
@@ -2280,19 +2081,119 @@ int TableStore::write(const Array<Clause>& columns, const Array<Clauses>& clause
         }
     }
 
-    if (fastPathUsed) {
-        Array<u64> targets;
-        targets.reserve(candidateIds.size());
-        for (u64 rId : candidateIds) {
-            targets.push(rId);
+    auto doUpdateRow = [&](u64 rId) {
+        Map<String, String>* row = fetchRow(rId);
+        if (!row) return;
+
+        currentMemoryBytes -= approxRowBytes(*row);
+        String keyToUse = encryptionKey;
+        if (keyToUse.isEmpty() && globalKeys) {
+            for (const auto& existingCol : columns) {
+                ParsedCol pc = parseCol(existingCol.col);
+                if (row->has(pc.name)) {
+                    String dummyKey;
+                    CryptItem::decrypt(*row->get(pc.name), *globalKeys, &dummyKey);
+                    if (!dummyKey.isEmpty()) {
+                        keyToUse = dummyKey;
+                        break;
+                    }
+                }
+            }
         }
-        for (u64 rId : targets) {
-            doUpdateRow(rId);
+
+        for (const auto& col : columns) {
+            ParsedCol pc = parseCol(col.col);
+            if (pc.type == ColType::WATCH) continue; // Skip watch in updates
+
+            String oldBlobHashToDecrement;
+            if (row->has(pc.name)) {
+                String oldV = *row->get(pc.name);
+                if (globalKeys) oldV = CryptItem::decrypt(oldV, *globalKeys);
+                else if (!keyToUse.isEmpty()) {
+                    Array<String> tempKeys; tempKeys.push(keyToUse);
+                    oldV = CryptItem::decrypt(oldV, tempKeys);
+                }
+                if (isBlobRef(oldV)) {
+                    oldBlobHashToDecrement = extractBlobHash(oldV);
+                }
+
+                // Remove rId from colHashIndex[pc.name][oldV]
+                if (!colHashIndexDirty && pc.name != "content" && oldV.size() <= 256 && colHashIndex.has(pc.name)) {
+                    auto* valMap = colHashIndex.get(pc.name);
+                    if (valMap->has(oldV)) {
+                        auto* rowIds = valMap->get(oldV);
+                        for (usz j = 0; j < rowIds->size(); ++j) {
+                            if ((*rowIds)[j] == rId) {
+                                (*rowIds)[j] = (*rowIds)[rowIds->size() - 1];
+                                rowIds->pop();
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (col.val == "") {
+                // Setting a column to "" means removing that column
+                if (row->has(pc.name)) {
+                    row->remove(pc.name);
+                }
+            } else if (pc.type == ColType::BLOB && blobStore) {
+                String content = col.val;
+                // Handle partial blob writes
+                if (pc.rangeSpec.size() > 0) {
+                    BlobRange br = parseBlobRange(pc.rangeSpec);
+                    if (br.valid && row->has(pc.name)) {
+                        String existing = resolveValue(*row->get(pc.name));
+                        content = applyBlobRange(existing, col.val, br);
+                    }
+                }
+                String hash = Security::hash(content, 16);
+                blobStore->writeHash(hash, 0, content, keyToUse, oldBlobHashToDecrement, currentSeq);
+                incrementBlobRef(hash);
+                String ref = makeBlobRef(hash);
+                row->set(pc.name, keyToUse.isEmpty() ? ref : CryptItem::encrypt(ref, keyToUse));
+            } else {
+                row->set(pc.name, keyToUse.isEmpty() ? col.val : CryptItem::encrypt(col.val, keyToUse));
+            }
+
+            // Add newVal to colHashIndex[pc.name][newVal] (only if column was not removed)
+            if (col.val != "" && !colHashIndexDirty && pc.name != "content" && row->has(pc.name)) {
+                String newVal = *row->get(pc.name);
+                if (newVal.size() <= 256) {
+                    if (globalKeys) newVal = CryptItem::decrypt(newVal, *globalKeys);
+                    else if (!keyToUse.isEmpty()) {
+                        Array<String> tempKeys; tempKeys.push(keyToUse);
+                        newVal = CryptItem::decrypt(newVal, tempKeys);
+                    }
+                    if (!colHashIndex.has(pc.name)) colHashIndex.set(pc.name, Map<String, Array<u64>>());
+                    colHashIndex.get(pc.name)->operator[](newVal).push(rId);
+                }
+            }
+
+            // Decrement old blob ref now that the new value has been set
+            if (!oldBlobHashToDecrement.isEmpty()) {
+                decrementBlobRef(oldBlobHashToDecrement);
+            }
         }
-    } else {
-        for (u64 rId : allRowIds) {
-            doUpdateRow(rId);
-        }
+
+        // Update MVCC mod sequence
+        currentSeq++;
+        rowModSeq.set(rId, currentSeq);
+
+        RowVersion rv;
+        rv.seq = currentSeq;
+        rv.row = *row;
+        rowHistory[rId].push(rv);
+        if (isVolatile) volatileRows.set(rId, true);
+        else dirtyBlocks.set(rId / 1000, true);
+
+        currentMemoryBytes += approxRowBytes(*row);
+        updateLru(rId);
+    };
+
+    for (u64 rId : targets) {
+        doUpdateRow(rId);
     }
     colBloomFiltersDirty = true;
     evictIfNeeded();
@@ -2302,66 +2203,7 @@ int TableStore::write(const Array<Clause>& columns, const Array<Clauses>& clause
 // ─── Remove ─────────────────────────────────────────────────────────────────
 
 bool TableStore::rm(const Array<Clauses>& clauses, u64 length, bool burn) {
-    resolvePathsInClauses(clauses, currentSeq, 0);
-
-    Array<u64> toRemove;
-    Array<u64> candidateIds;
-    bool fastPathUsed = false;
-    if (clauses.size() == 1) { 
-        bool allEq = true;
-        for (const auto& c : clauses[0]) {
-            if (c.op != "=") { allEq = false; break; }
-            if (c.val.startsWith("parent.")) { allEq = false; break; } 
-        }
-        if (allEq && clauses[0].size() > 0 && !clauses[0].isAssert && !disableIndex) {
-            if (colHashIndexDirty) rebuildColHashIndex();
-            
-            bool impossible = false;
-            bool firstCol = true;
-            for (const auto& c : clauses[0]) {
-                auto* valMap = colHashIndex.get(c.col);
-                if (!valMap) { impossible = true; break; } 
-                
-                auto* rowIds = valMap->get(c.val);
-                if (!rowIds) { impossible = true; break; } 
-                
-                if (firstCol) {
-                    candidateIds = *rowIds;
-                    firstCol = false;
-                } else {
-                    Array<u64> intersected;
-                    for (u64 rId : *rowIds) {
-                        for (u64 crId : candidateIds) {
-                            if (rId == crId) { intersected.push(rId); break; }
-                        }
-                    }
-                    candidateIds = intersected;
-                    if (candidateIds.size() == 0) { impossible = true; break; }
-                }
-            }
-            if (!impossible) {
-                fastPathUsed = true;
-            }
-        }
-    }
-
-    if (fastPathUsed) {
-        for (u64 rId : candidateIds) {
-            Map<String, String>* row = fetchRow(rId);
-            if (!row) continue;
-            if (evaluateClauses(*row, clauses, nullptr, rId) >= 0.0f) {
-                toRemove.push(rId);
-            }
-        }
-    } else {
-        for (u64 rId : allRowIds) {
-            Map<String, String>* row = fetchRow(rId);
-            if (!row) continue;
-            if (evaluateClauses(*row, clauses, nullptr, rId) >= 0.0f) {
-                toRemove.push(rId);
-            }
-        }
-    }
+    Array<u64> toRemove = getMatchingRowIds(clauses, currentSeq, 0);
 
     // Lock check: if any matching items are locked, fail the entire operation
     for (usz i = 0; i < toRemove.size(); ++i) {

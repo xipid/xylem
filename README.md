@@ -29,24 +29,29 @@ Xylem provides a complete suite of storage, query, and relational capabilities, 
 
 ### 🔗 3. Graph Traversal Engine
 *   **Native Graph Pathing:** Relational matching using highly optimized graph pipelines (`MATCH`, `FOLLOW`, `REPEATFOLLOW`, `UNTIL`).
-*   **Batch Graph Mutations:** Update or remove entire relational trees instantaneously with `GRAPHWRITE ... SET/REMOVE`.
-*   **VFS Macros:** Built-in Virtual File System syntax to `EXTRACT`, `CAT`, `TEE`, and ingest tree-like folder structures.
+*   **Batch Graph Mutations:** Update or remove entire relational trees instantaneously using standard `WRITE` or `RM` with graph path predicates.
+*   **VFS Macros:** Built-in Virtual File System syntax to `CAT`, `TEE`, `CP`, `MV`, and range-slice tree-like folder structures.
 
-### 🛡️ 4. Multi-Version Concurrency Control (MVCC)
-*   **ACID Compliance:** Transactional isolation preventing write-write conflicts.
-*   **Pessimistic Locks & Snapshots:** Lock rows instantly for massive bulk operations, with instant rollback support via `ROLLBACK <txId>`.
+### 🛡️ 4. Multi-Version Concurrency Control (MVCC) & Predicate Locking
+*   **ACID Compliance & Predicate Locks:** Clause-based locking protecting queries (including future inserts/updates) instead of just static row IDs.
+*   **Snapshot Versioning (MVCC):** Keeps track of historical row versions and tombstones, allowing readers to view consistent snapshots without blocking concurrent writers.
+*   **Auto rollback:** Automatically roll back transaction changes on write-write conflict or manually via `ROLLBACK <txId>`.
 
-### 📦 5. CAS Blob Deduplication
+### 📦 5. CAS Blob Deduplication & Physical Shredding
 *   **Blake2b-128 Hashing:** Content Addressable Storage ensures identical blobs (files/assets) are only stored once on the disk.
 *   **Blob Freezing/Thawing:** Use `FREEZE <pos>` to bypass copy-on-write overheads and lock binaries directly to flash addresses (e.g. for ESP32 bootloaders!).
+*   **Physical Shredding (BURN):** Irrevocably erase matching rows and physically shred/overwrite associated blobs, automatically merging and rewriting diff-dependencies of remaining records.
 
 ### 🔔 6. Reactive Pub/Sub & Watchers
 *   **Query Watchers:** Set up native callbacks via `WATCH WHERE ...` to trigger real-time updates when matching data is mutated.
 *   **Virtual Ephemeral Columns:** Pass zero-disk messages instantly through the database engine without invoking the block allocator.
 
+### 🔌 8. Query Overlays & Hooks
+*   **Operation Interception:** Intercept, redirect, or mock database reads, writes, and custom operators using flexible callbacks (`onOverlayRead`, `onOverlayWrite`, etc.).
+
 ### 🛠️ 7. Unified Query Language & CLI
 *   **Interactive REPL:** Use the `xy` binary as a full-fledged SQL-like shell to manage your database.
-*   **Unified Syntax:** Perform CRUD (`READ`, `WRITE`), Graph Traversals (`GRAPHREAD`), Pub/Sub (`PULL`, `WATCH`), and Admin tasks (`VACUUM`, `DESTROY`) from a single language.
+*   **Unified Syntax:** Perform CRUD and Graph Traversals (`READ`, `WRITE`), Pub/Sub (`PULL`, `WATCH`), and Admin tasks (`VACUUM`, `DESTROY`) from a single language.
 
 ---
 
@@ -66,7 +71,7 @@ Xylem provides a built-in shell for rapid prototyping.
 ```
 ```sql
 > WRITE name=Alice role=Engineer id:generate=0
-> GRAPHREAD id MATCH name=Alice FOLLOW reports_to=parent.id
+> READ id MATCH name=Alice FOLLOW reports_to=parent.id
 > VACUUM
 ```
 

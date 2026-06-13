@@ -54,30 +54,31 @@ BURN WHERE classification=secret
 
 ## 2. Graph Traversals
 
-Xylem natively supports graph traversals, allowing you to walk relational hierarchies instantly using `GRAPHREAD`, `GRAPHWRITE`, or `GRAPHWRITEVOLATILE`.
+Xylem natively supports graph traversals, allowing you to walk relational hierarchies instantly using standard `READ`, `WRITE`, or `WRITEVOLATILE` commands combined with graph pathing clauses.
 
-### `GRAPHREAD`
-The `GRAPHREAD` command takes an initial set of matched nodes and navigates through the graph:
+### Graph Queries in `READ`
+The `READ` command can navigate through relational graphs by appending traversal steps:
 ```sql
-GRAPHREAD id name MATCH name=root FOLLOW parent_id=parent.id
+READ id name MATCH name=root FOLLOW parent_id=parent.id
 ```
 **Graph Traversal Steps:**
 *   `MATCH <clauses>`: Fetches the starting nodes.
 *   `FOLLOW <clauses>`: Follows relational links one level deep (e.g. `parent_id=parent.id` compares the `parent_id` of the child with the `id` of the matched parent).
 *   `REPEATFOLLOW <clauses>`: Recursively follows links until no more matches are found.
 *   `UNTIL <clauses>`: Stops traversing a branch when the condition is met.
-*   `EXTRACT <path>`: A macro for extracting directory-like tree structures.
 
-### `GRAPHWRITE`
-Update or mutate an entire relational tree at once:
+### Graph Mutations in `WRITE`
+Update or mutate an entire relational tree at once by applying graph pathing predicates to `WRITE`:
 ```sql
-GRAPHWRITE MATCH name=root REPEATFOLLOW parent_id=parent.id SET perms=777
+WRITE perms=777 MATCH name=root REPEATFOLLOW parent_id=parent.id
 ```
-**Mutations:**
-*   `SET <clauses>`: Applies the specified columns to all active traversed nodes.
-*   `REMOVE`: Deletes all active traversed nodes.
+All matched nodes in the traversal tree will receive the specified updates.
 
----
+To delete an entire relational tree, combine graph pathing predicates with the `RM` or `BURN` commands:
+```sql
+RM MATCH name=root REPEATFOLLOW parent_id=parent.id
+```
+
 
 ## 3. Database Administration
 

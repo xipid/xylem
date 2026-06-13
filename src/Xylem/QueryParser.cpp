@@ -119,11 +119,11 @@ static void parseClausesFromTokens(const Array<String>& tokens, usz& idx, Array<
         String t = tokens[idx];
         String tu = t.toUpperCase();
         
-        if (tu == "LIMIT" || tu == "PAGE") {
+        if (tu == "LIMIT" || tu == "PAGE" || tu == "SET" || tu == "REMOVE") {
             break;
         }
         
-        if (tu == "WHERE") {
+        if (tu == "WHERE" || tu == "MATCH") {
             if (currentGroup.size() > 0) {
                 currentGroup.isAssert = inAssert;
                 currentGroup.isFollow = inFollow;
@@ -631,19 +631,19 @@ QueryResult QueryParser::execute(XylemEngine* engine, const String& queryStr, co
         return res;
     }
 
-    // Standard CRUD (READ, WRITE, WRITEVOLATILE, RM)
+    // Standard CRUD (READ, WRITE, WRITEVOLATILE, RM, BURN)
     bool isRead = (cmd == "READ" || cmd == "READ*");
     if (isRead || cmd == "WRITE" || cmd == "WRITEVOLATILE" || cmd == "RM" || cmd == "BURN") {
         bool readAllColumns = (cmd == "READ*");
         Array<String> columns;
         Array<Clause> writeCols;
         Array<Clauses> queryClauses;
-        
+
         usz idx = 1;
         while (idx < tokens.size()) {
             String t = tokens[idx];
             String tu = t.toUpperCase();
-            if (tu == "WHERE" || tu == "ASSERT" || tu == "FOLLOW" || tu == "REPEATFOLLOW" || tu == "LIMIT" || tu == "PAGE") {
+            if (tu == "WHERE" || tu == "MATCH" || tu == "ASSERT" || tu == "FOLLOW" || tu == "REPEATFOLLOW" || tu == "LIMIT" || tu == "PAGE") {
                 break;
             }
             if (isRead) {
@@ -672,9 +672,9 @@ QueryResult QueryParser::execute(XylemEngine* engine, const String& queryStr, co
         if (cmd == "READ" && columns.size() == 0) {
             readAllColumns = true;
         }
-        
+
         parseClausesFromTokens(tokens, idx, queryClauses);
-        
+
         // Retrieve LIMIT and PAGE parameters
         u64 limitVal = 0;
         u64 pageVal = 0;

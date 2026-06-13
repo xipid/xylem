@@ -748,6 +748,29 @@ int main() {
     Error("Query Parser pagination (LIMIT and PAGE) failed!");
   }
 
+  // --- Graph Queries via Parser ---
+  Info("Testing Graph Queries via parser...");
+  xm.query("WRITE name=root id=91000");
+  xm.query("WRITE name=child1 parent_id=91000 id=91001");
+  xm.query("WRITE name=child2 parent_id=91000 id=91002");
+
+  QueryResult grRes = xm.query("READ id MATCH id=91000 REPEATFOLLOW parent_id=parent.id");
+  Info("grRes size=" + String::from((u64)grRes.readRows.size()));
+  if (grRes.readRows.size() == 3) {
+    Success("Graph READ via parser works perfectly.");
+  } else {
+    Error("Graph READ via parser failed! returned size=" + String::from((u64)grRes.readRows.size()));
+  }
+
+  xm.query("WRITE tag=graph_test MATCH id=91000 REPEATFOLLOW parent_id=parent.id");
+  QueryResult grWriteCheck = xm.query("READ id tag WHERE tag=graph_test");
+  if (grWriteCheck.readRows.size() == 3) {
+    Success("Graph WRITE via parser works perfectly.");
+  } else {
+    Error("Graph WRITE via parser failed! returned size=" + String::from((u64)grWriteCheck.readRows.size()));
+  }
+
+
   // --- Ported/New Feature: Clause-based locks (preventing future inserts) ---
   Info("Testing Clause-based locking and conflict detection...");
   xm.printActiveLocks();
